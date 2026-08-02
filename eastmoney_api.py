@@ -565,6 +565,33 @@ class EastMoneyAPI:
         
         return None
 
+    def _parse_kline_klines(self, klines: list) -> list[dict]:
+        """解析东方财富K线 CSV 列表为 history dicts（从旧到新）。
+
+        klines 每行格式: 日期,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
+        产出键: date/open/close/high/low/volume/amount/change_rate（与基金历史一致）
+        """
+        history = []
+        for line in klines:
+            # 格式: 日期,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
+            parts = line.split(",")
+            if len(parts) >= 11:
+                try:
+                    history.append({
+                        "date": parts[0],
+                        "open": float(parts[1]),
+                        "close": float(parts[2]),
+                        "high": float(parts[3]),
+                        "low": float(parts[4]),
+                        "volume": float(parts[5]),
+                        "amount": float(parts[6]),
+                        "change_rate": float(parts[8]) if parts[8] else 0.0,
+                    })
+                except (ValueError, IndexError) as e:
+                    logger.debug(f"解析K线数据失败: {line}, 错误: {e}")
+                    continue
+        return history
+
     async def _get_exchange_fund_history(
         self,
         fund_code: str,
@@ -573,25 +600,25 @@ class EastMoneyAPI:
     ) -> Optional[list]:
         """
         获取场内基金（ETF/LOF）历史K线数据
-        
+
         Args:
             fund_code: 基金代码
             days: 获取天数
             adjust: 复权类型
-            
+
         Returns:
             历史数据列表或 None
         """
         market = self._get_market_code(fund_code)
-        
+
         # 复权类型转换
         fq_map = {"qfq": "1", "hfq": "2", "": "0"}
         fq = fq_map.get(adjust, "1")
-        
+
         # 计算日期范围（多获取一些以覆盖节假日）
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days * 3 + 60)
-        
+
         params = {
             "secid": f"{market}.{fund_code}",
             "fields1": "f1,f2,f3,f4,f5,f6",
@@ -602,42 +629,23 @@ class EastMoneyAPI:
             "end": end_date.strftime("%Y%m%d"),
             "lmt": str(days * 3),  # 限制数量
         }
-        
+
         data = await self._request(self.KLINE_API, params)
         if data and data.get("rc") == 0:
             result = data.get("data", {})
             klines = result.get("klines", [])
-            
+
             if klines:
-                history = []
-                for line in klines:
-                    # 格式: 日期,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
-                    parts = line.split(",")
-                    if len(parts) >= 11:
-                        try:
-                            history.append({
-                                "date": parts[0],
-                                "open": float(parts[1]),
-                                "close": float(parts[2]),
-                                "high": float(parts[3]),
-                                "low": float(parts[4]),
-                                "volume": float(parts[5]),
-                                "amount": float(parts[6]),
-                                "change_rate": float(parts[8]) if parts[8] else 0.0,
-                            })
-                        except (ValueError, IndexError) as e:
-                            logger.debug(f"解析K线数据失败: {line}, 错误: {e}")
-                            continue
-                
+                history = self._parse_kline_klines(klines)
                 if history:
                     return history[-days:] if len(history) > days else history
-        
+
         # === 备用源: 腾讯财经K线 ===
         logger.debug(f"东方财富K线获取失败，尝试腾讯财经: {fund_code}")
         result = await self._get_exchange_history_tencent(fund_code, days)
         if result:
             return result
-        
+
         # === 备用源: 场外基金历史净值 API ===
         logger.debug(f"腾讯K线获取失败，尝试场外基金历史API: {fund_code}")
         return await self._get_otc_fund_history(fund_code, days)
@@ -708,6 +716,93 @@ class EastMoneyAPI:
                 return history[-days:] if len(history) > days else history
         except Exception as e:
             logger.debug(f"腾讯K线获取失败: {fund_code} - {e}")
+        return None
+
+    async def get_stock_kline(
+        self,
+        stock_code: str,
+        days: int = 60,
+        adjust: str = "qfq",
+    ) -> Optional[list]:
+        """获取 A 股日 K 线历史数据。
+
+        复用场内 K 线接口（与基金 K 线同源），绕过 _is_otc_fund 路由，
+        使深市 0/2 开头等股票代码直接走 K 线路径而非场外净值路径。
+
+        Args:
+            stock_code: A 股股票代码（600519 / 000001 / 300750 等）
+            days: 获取天数
+            adjust: 复权类型 qfq-前复权, hfq-后复权, ""-不复权
+
+        Returns:
+            history dicts（date/open/close/high/low/volume/amount/change_rate，从旧到新）或 None
+        """
+        stock_code = str(stock_code).strip().zfill(6)
+        market = self._get_market_code(stock_code)
+
+        # 复权类型转换
+        fq_map = {"qfq": "1", "hfq": "2", "": "0"}
+        fq = fq_map.get(adjust, "1")
+
+        # 计算日期范围（多获取一些以覆盖节假日）
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days * 3 + 60)
+
+        params = {
+            "secid": f"{market}.{stock_code}",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": "101",  # 日K线
+            "fqt": fq,
+            "beg": start_date.strftime("%Y%m%d"),
+            "end": end_date.strftime("%Y%m%d"),
+            "lmt": str(days * 3),  # 限制数量
+        }
+
+        data = await self._request(self.KLINE_API, params)
+        if data and data.get("rc") == 0:
+            result = data.get("data", {})
+            klines = result.get("klines", [])
+
+            if klines:
+                history = self._parse_kline_klines(klines)
+                if history:
+                    return history[-days:] if len(history) > days else history
+
+        # === 备用源: 腾讯财经K线 ===
+        logger.debug(f"东方财富股票K线失败，尝试腾讯财经: {stock_code}")
+        return await self._get_exchange_history_tencent(stock_code, days)
+
+    async def get_stock_flow(
+        self, stock_code: str, days: int = 10
+    ) -> Optional[list[dict]]:
+        """获取 A 股资金流向数据（主力/超大单/大单/中单/小单净流入）。
+
+        与 get_fund_flow 不同，这里绕过 _is_otc_fund 守卫，直接复用底层的
+        push2 / datacenter 股票资金流向接口，使深市 0/2 开头股票也能取到。
+
+        Args:
+            stock_code: A 股股票代码
+            days: 获取天数
+
+        Returns:
+            资金流向数据列表（date/main_net_inflow/small_inflow/medium_inflow/
+            large_inflow/super_large_inflow）或 None
+        """
+        stock_code = str(stock_code).strip().zfill(6)
+
+        # === 1. 东方财富 push2 主源 ===
+        result = await self._get_fund_flow_eastmoney(stock_code, days)
+        if result:
+            return result
+
+        # === 2. 东方财富 datacenter 备用源 ===
+        logger.debug(f"push2股票资金流向失败，尝试datacenter: {stock_code}")
+        result = await self._get_fund_flow_datacenter(stock_code, days)
+        if result:
+            return result
+
+        logger.warning(f"所有股票资金流向数据源均失败: {stock_code}")
         return None
 
     async def get_lof_list(self, use_cache: bool = True) -> Optional[list]:

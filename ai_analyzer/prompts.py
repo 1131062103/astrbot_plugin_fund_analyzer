@@ -40,7 +40,7 @@ NEWS_SUMMARY_PROMPT = """请简要总结当前"{fund_name}"（追踪{underlying}
 1. **商品/资产价格动态**：相关商品或资产的最新国际/国内价格走势
 2. **国际形势与地缘政治**：当前国际局势对该资产的影响（如地缘冲突、大国博弈等）
 3. **央行与货币政策**：美联储、中国央行等政策动向及其影响
-4. **政策与事件影响**：近期影响该基金的重要政策或突发事件
+4. **政策与事件影响**：近期影响该{subject_type}的重要政策或突发事件
 5. **市场情绪与资金**：市场情绪变化和资金流向趋势
 6. **季节性因素**：当前时期的季节性消费/需求特点
 
@@ -51,13 +51,13 @@ NEWS_SUMMARY_PROMPT = """请简要总结当前"{fund_name}"（追踪{underlying}
 # 主分析提示词模板
 # ============================================================
 
-ANALYSIS_PROMPT_TEMPLATE = """你是一位专业的量化基金分析师，精通中国市场和国际形势。请基于以下量化数据和技术指标对基金进行深度分析，并给出**明确具体**的投资建议。
+ANALYSIS_PROMPT_TEMPLATE = """你是一位专业的量化{subject_type}分析师，精通中国市场和国际形势。请基于以下量化数据和技术指标对{subject_type}进行深度分析，并给出**明确具体**的投资建议。
 
 **⚠️ 重要要求：你必须同时给出看涨理由和看跌理由，保持分析的客观平衡。即使整体看多，也必须详细说明潜在的下跌风险和看跌因素。**
 
-## 基金基本信息
-- 基金名称: {fund_name}
-- 基金代码: {fund_code}
+## {subject_type}基本信息
+- {subject_type}名称: {fund_name}
+- {subject_type}代码: {fund_code}
 - 最新价格: {latest_price:.4f}
 - 今日涨跌: {change_rate:+.2f}%
 - 成交额: {amount:,.0f}
@@ -89,11 +89,11 @@ ANALYSIS_PROMPT_TEMPLATE = """你是一位专业的量化基金分析师，精�
 
 ## 请按以下格式输出分析报告:
 
-### 1. 基金概况
-简要介绍该基金的投资标的和特点
+### 1. {subject_type}概况
+简要介绍该{subject_type}的投资标的和特点
 
 ### 2. 量化绩效评估
-基于夏普比率、索提诺比率、最大回撤等指标评估基金的风险调整后收益表现
+基于夏普比率、索提诺比率、最大回撤等指标评估{subject_type}的风险调整后收益表现
 
 ### 3. 技术面分析
 #### 3.1 MACD指标深度解读
@@ -117,10 +117,10 @@ ANALYSIS_PROMPT_TEMPLATE = """你是一位专业的量化基金分析师，精�
 - 当前国际局势对该资产的影响（地缘冲突、大国关系等）
 - 美联储/各国央行政策走向
 - 全球资金流向和避险情绪
-- 对该基金的利多/利空判断
+- 对该{subject_type}的利多/利空判断
 
 ### 5. 影响因素综合分析
-分析各个影响因素的当前状态和对基金的影响，包括：
+分析各个影响因素的当前状态和对{subject_type}的影响，包括：
 - 宏观经济因素
 - 行业/商品供需
 - 政策面影响
@@ -169,7 +169,7 @@ ANALYSIS_PROMPT_TEMPLATE = """你是一位专业的量化基金分析师，精�
 - 关键支撑位跌破后的下行空间评估
 
 #### 9.2 基本面/宏观风险
-- 可能导致基金下跌的宏观经济风险因素
+- 可能导致{subject_type}下跌的宏观经济风险因素
 - 政策变化风险（加息、监管收紧等）
 - 行业/标的特有的下行风险
 
@@ -198,7 +198,7 @@ ANALYSIS_PROMPT_TEMPLATE = """你是一位专业的量化基金分析师，精�
 # 简化版分析提示词（用于快速分析）
 # ============================================================
 
-QUICK_ANALYSIS_PROMPT = """请对基金【{fund_name}】({fund_code})进行快速分析。
+QUICK_ANALYSIS_PROMPT = """请对{subject_type}【{fund_name}】({fund_code})进行快速分析。
 
 当前价格: {latest_price:.4f}
 今日涨跌: {change_rate:+.2f}%
@@ -214,15 +214,15 @@ QUICK_ANALYSIS_PROMPT = """请对基金【{fund_name}】({fund_code})进行快�
 # 风险评估提示词
 # ============================================================
 
-RISK_ASSESSMENT_PROMPT = """请对基金【{fund_name}】进行风险评估。
+RISK_ASSESSMENT_PROMPT = """请对{subject_type}【{fund_name}】进行风险评估。
 
-基金类型: {fund_type}
+{subject_type}类型: {fund_type}
 追踪标的: {underlying}
 近20日波动率: {volatility}
 近20日最高价: {high_20d}
 近20日最低价: {low_20d}
 
-请列出该基金的主要风险点（3-5条），并给出风险等级评估（低/中/高）。"""
+请列出该{subject_type}的主要风险点（3-5条），并给出风险等级评估（低/中/高）。"""
 
 
 # ============================================================
@@ -240,6 +240,7 @@ class AnalysisPromptBuilder:
         seasonal_context: str = "",
         search_keywords: list[str] | None = None,
         global_situation_text: str = "",
+        subject_type: str = "基金",
     ) -> str:
         """
         构建新闻摘要提示词
@@ -250,6 +251,7 @@ class AnalysisPromptBuilder:
             seasonal_context: 当前季节性背景
             search_keywords: 建议的搜索关键词列表
             global_situation_text: 国际形势分析文本
+            subject_type: 标的类型（基金/股票）
 
         Returns:
             提示词字符串
@@ -259,6 +261,7 @@ class AnalysisPromptBuilder:
         keywords_str = "、".join(search_keywords[:8]) if search_keywords else underlying
 
         return NEWS_SUMMARY_PROMPT.format(
+            subject_type=subject_type,
             fund_name=fund_name,
             underlying=underlying,
             current_date=datetime.now().strftime("%Y年%m月%d日"),
@@ -268,53 +271,13 @@ class AnalysisPromptBuilder:
         )
 
     @staticmethod
-    def build_analysis_prompt(
-        fund_name: str,
-        fund_code: str,
-        latest_price: float,
-        change_rate: float,
-        amount: float,
-        factors_text: str,
-        tech_summary: str,
-        history_summary: str,
-        news_summary: str = "",
-    ) -> str:
-        """
-        构建主分析提示词
-
-        Args:
-            fund_name: 基金名称
-            fund_code: 基金代码
-            latest_price: 最新价格
-            change_rate: 涨跌幅
-            amount: 成交额
-            factors_text: 影响因素文本
-            tech_summary: 技术指标摘要
-            history_summary: 历史行情摘要
-            news_summary: 新闻摘要
-
-        Returns:
-            提示词字符串
-        """
-        return ANALYSIS_PROMPT_TEMPLATE.format(
-            fund_name=fund_name,
-            fund_code=fund_code,
-            latest_price=latest_price,
-            change_rate=change_rate,
-            amount=amount,
-            factors_text=factors_text,
-            tech_summary=tech_summary if tech_summary else "暂无数据",
-            history_summary=history_summary if history_summary else "暂无数据",
-            news_summary=news_summary if news_summary else "暂无相关新闻",
-        )
-
-    @staticmethod
     def build_quick_prompt(
         fund_name: str,
         fund_code: str,
         latest_price: float,
         change_rate: float,
         trend: str,
+        subject_type: str = "基金",
     ) -> str:
         """
         构建快速分析提示词
@@ -325,11 +288,13 @@ class AnalysisPromptBuilder:
             latest_price: 最新价格
             change_rate: 涨跌幅
             trend: 技术趋势
+            subject_type: 标的类型（基金/股票）
 
         Returns:
             提示词字符串
         """
         return QUICK_ANALYSIS_PROMPT.format(
+            subject_type=subject_type,
             fund_name=fund_name,
             fund_code=fund_code,
             latest_price=latest_price,
@@ -345,6 +310,7 @@ class AnalysisPromptBuilder:
         volatility: float,
         high_20d: float,
         low_20d: float,
+        subject_type: str = "基金",
     ) -> str:
         """
         构建风险评估提示词
@@ -356,11 +322,13 @@ class AnalysisPromptBuilder:
             volatility: 波动率
             high_20d: 20日最高价
             low_20d: 20日最低价
+            subject_type: 标的类型（基金/股票）
 
         Returns:
             提示词字符串
         """
         return RISK_ASSESSMENT_PROMPT.format(
+            subject_type=subject_type,
             fund_name=fund_name,
             fund_type=fund_type,
             underlying=underlying,

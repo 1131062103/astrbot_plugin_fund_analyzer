@@ -25,6 +25,30 @@ from .image_generator import render_fund_image, PLAYWRIGHT_AVAILABLE
 # 导入东方财富 API 模块（直接 HTTP 请求，不依赖 akshare）
 from .eastmoney_api import get_api as get_eastmoney_api
 
+# ============================================================
+# 指令组标记（AstrBot 原生指令组，空格分隔：`基金 行情` / `股票 行情`）
+# 组标记函数体不执行，仅用于注册子指令（@基金.command / @股票.command）
+# ============================================================
+@filter.command_group("基金")
+def 基金():
+    """基金指令组：只含基金相关指令"""
+    pass
+
+
+@filter.command_group("股票")
+def 股票():
+    """股票指令组：只含 A 股股票相关指令"""
+    pass
+
+
+class CommandAbort(Exception):
+    """指令处理中途需终止并提示用户的消息，由各 handler try/except 捕获显示。"""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+
 # 默认超时时间（秒）- AKShare获取LOF数据需要较长时间
 DEFAULT_TIMEOUT = 120  # 2分钟
 # 数据缓存有效期（秒）
@@ -257,6 +281,8 @@ class FundAnalyzerPlugin(Star):
         self.analyzer = FundAnalyzer()
         # 初始化股票分析器
         self.stock_analyzer = StockAnalyzer()
+        # 东方财富 API 单例（与 self.analyzer._api 同一实例），供股票 K 线/资金流直接调用
+        self._emapi = get_eastmoney_api()
         # 初始化图片渲染器
         self.image_renderer = HtmlRenderer()
         # 是否使用本地图片生成器（优先使用）
@@ -335,6 +361,105 @@ class FundAnalyzerPlugin(Star):
             return None
         # 补齐前导0到6位
         return code_str.zfill(6)
+
+    # ============================================================
+    # 共享校验 / 渲染 helper（基金组与股票组的薄句柄共用）
+    # ============================================================
+
+    async def _get_fund_info(self, event, code: str) -> FundInfo:
+        """获取并校验基金实时信息；失败抛 CommandAbort 给出友好提示。"""
+        user_id = event.get_sender_id()
+        normalized_code = self._normalize_fund_code(code)
+        fund_code = normalized_code or self._get_user_fund(user_id)
+
+        if not fund_code:
+            raise CommandAbort("❌ 基金代码不能为空")
+
+        info = await self.analyzer.get_lof_realtime(fund_code)
+        if info:
+            return info
+
+        # 实时失败：区分代码错误 vs 数据源问题
+        if len(fund_code) == 6 and fund_code.isdigit():
+            try:
+                search_res = await self.analyzer.search_fund(fund_code)
+                if not search_res:
+                    raise CommandAbort(
+                        f"❌ 未找到基金代码 {fund_code}\n"
+                        "💡 请检查代码是否正确，或使用「基金 搜索 关键词」查找\n"
+                        "💡 使用「基金 行情 代码」查看详情"
+                    )
+            except CommandAbort:
+                raise
+            except Exception:
+                pass  # 搜索出错忽略，继续下面的判断
+
+        raise CommandAbort(
+            f"⚠️ 暂时无法获取基金 {fund_code} 的数据\n"
+            "💡 可能是数据源暂时不可用，或该基金为非LOF基金\n"
+            "💡 请稍后重试"
+        )
+
+    async def _get_stock_info(self, event, code: str) -> StockInfo:
+        """获取并校验 A 股股票实时信息；失败抛 CommandAbort。"""
+        stock_code = str(code).strip().zfill(6) if code else ""
+
+        if not stock_code:
+            raise CommandAbort(
+                "❌ 请输入股票代码\n"
+                "💡 用法: 股票 行情 <股票代码>\n"
+                "💡 示例: 股票 行情 000001 (平安银行)\n"
+                "💡 示例: 股票 行情 600519 (贵州茅台)"
+            )
+
+        info = await self.stock_analyzer.get_stock_realtime(stock_code)
+        if info:
+            return info
+
+        raise CommandAbort(
+            f"❌ 未找到股票代码 {stock_code}\n"
+            "💡 请使用「股票 搜索 关键词」来搜索正确的股票代码\n"
+            "💡 示例: 股票 搜索 茅台"
+        )
+
+    async def _get_stock_history(self, stock_code: str, days: int = 60) -> list[dict]:
+        """获取 A 股日 K 线历史（股票数据源）。"""
+        history = await self._emapi.get_stock_kline(stock_code, days=days)
+        return history or []
+
+    def _resolve_template(self, name: str) -> Path:
+        """解析模板路径：优先数据目录，回退插件目录。"""
+        p = self._data_dir / "templates" / name
+        if p.exists():
+            return p
+        return Path(__file__).parent / "templates" / name
+
+    async def _render_report(self, template_name: str, data: dict, width: int = 420):
+        """渲染报告模板为图片，返回图片对象；本地渲染优先，回退网络渲染。
+
+        用于 yield event.image_result(...) 的返回值（本地为文件路径，网络为 URL）。
+        """
+        template_path = self._resolve_template(template_name)
+        if not template_path.exists():
+            raise CommandAbort(f"❌ 模板文件缺失: {template_name}")
+
+        # 本地渲染（Playwright 可用时）
+        if self.use_local_renderer:
+            try:
+                img_path = await render_fund_image(
+                    template_path=template_path, template_data=data, width=width
+                )
+                return img_path
+            except Exception as e:
+                logger.warning(f"本地渲染失败，回退到网络渲染: {e}")
+
+        # 网络渲染
+        with open(template_path, "r", encoding="utf-8") as f:
+            template_str = f.read()
+        img_url = await self.image_renderer.render_custom_template(
+            tmpl_str=template_str, tmpl_data=data, return_url=True
+        )
+        return img_url
 
     def _format_fund_info(self, info: FundInfo) -> str:
         """格式化基金信息为文本"""
@@ -673,38 +798,33 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"获取今日行情出错: {e}")
             yield event.plain_result(f"❌ 获取行情失败: {str(e)}")
 
-    @filter.command("股票")
-    async def stock_query(self, event: AstrMessageEvent, code: str = ""):
+    @股票.command("行情")
+    async def stock_market(self, event: AstrMessageEvent, code: str = ""):
         """
         查询A股实时行情
-        用法: 股票 <股票代码>
-        示例: 股票 000001
-        示例: 股票 600519
+        用法: 股票 行情 <股票代码>
+        示例: 股票 行情 000001
+        示例: 股票 行情 600519
         """
         try:
-            if not code:
+            stock_code = str(code).strip().zfill(6) if code else ""
+            if not stock_code:
                 yield event.plain_result(
                     "❌ 请输入股票代码\n"
-                    "💡 用法: 股票 <股票代码>\n"
-                    "💡 示例: 股票 000001 (平安银行)\n"
-                    "💡 示例: 股票 600519 (贵州茅台)"
+                    "💡 用法: 股票 行情 <股票代码>\n"
+                    "💡 示例: 股票 行情 000001 (平安银行)\n"
+                    "💡 示例: 股票 行情 600519 (贵州茅台)"
                 )
                 return
 
-            stock_code = str(code).strip().zfill(6)
             yield event.plain_result(f"🔍 正在查询股票 {stock_code} 的实时行情...")
 
-            info = await self.stock_analyzer.get_stock_realtime(stock_code)
+            info = await self._get_stock_info(event, code)
 
-            if info:
-                yield event.plain_result(self._format_stock_info(info))
-            else:
-                yield event.plain_result(
-                    f"❌ 未找到股票代码 {stock_code}\n"
-                    "💡 请使用「搜索股票 关键词」来搜索正确的股票代码\n"
-                    "💡 示例: 搜索股票 茅台"
-                )
+            yield event.plain_result(self._format_stock_info(info))
 
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
         except ImportError:
             yield event.plain_result(
                 "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
@@ -715,19 +835,19 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"查询股票行情出错: {e}")
             yield event.plain_result(f"❌ 查询失败: {str(e)}")
 
-    @filter.command("搜索股票")
-    async def search_stock(self, event: AstrMessageEvent, keyword: str = ""):
+    @股票.command("搜索")
+    async def stock_search(self, event: AstrMessageEvent, keyword: str = ""):
         """
         搜索A股股票
-        用法: 搜索股票 <关键词>
-        示例: 搜索股票 茅台
+        用法: 股票 搜索 <关键词>
+        示例: 股票 搜索 茅台
         """
         try:
             if not keyword:
                 yield event.plain_result(
                     "❌ 请输入搜索关键词\n"
-                    "💡 用法: 搜索股票 <关键词>\n"
-                    "💡 示例: 搜索股票 茅台"
+                    "💡 用法: 股票 搜索 <关键词>\n"
+                    "💡 示例: 股票 搜索 茅台"
                 )
                 return
 
@@ -754,7 +874,7 @@ class FundAnalyzerPlugin(Star):
                     f"   💰 {stock['price']:.2f} {change_emoji} {stock['change_rate']:+.2f}%"
                 )
             lines.append("━━━━━━━━━━━━━━━━━")
-            lines.append("💡 使用「股票 代码」查看详细行情")
+            lines.append("💡 使用「股票 行情 代码」查看详细行情")
 
             yield event.plain_result("\n".join(lines))
 
@@ -768,51 +888,24 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"搜索股票出错: {e}")
             yield event.plain_result(f"❌ 搜索失败: {str(e)}")
 
-    @filter.command("基金")
-    async def fund_query(self, event: AstrMessageEvent, code: str = ""):
+    @基金.command("行情")
+    async def fund_market(self, event: AstrMessageEvent, code: str = ""):
         """
         查询基金实时行情
-        用法: 基金 [基金代码]
-        示例: 基金 161226
+        用法: 基金 行情 [基金代码]
+        示例: 基金 行情 161226
         """
         try:
-            user_id = event.get_sender_id()
-            # 标准化基金代码，补齐前导0
             normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
+            if code and not normalized_code:
+                yield event.plain_result("❌ 基金代码不能为空")
+                return
 
-            yield event.plain_result(f"🔍 正在查询基金 {fund_code} 的实时行情...")
+            info = await self._get_fund_info(event, code)
+            yield event.plain_result(self._format_fund_info(info))
 
-            info = await self.analyzer.get_lof_realtime(fund_code)
-
-            if info:
-                yield event.plain_result(self._format_fund_info(info))
-            else:
-                # 区分是基金代码错误还是数据源问题
-                if not normalized_code:
-                    yield event.plain_result(f"❌ 基金代码不能为空")
-                    return
-
-                # 如果代码是6位数字，通常是有效的基金代码格式，但未找到数据
-                if len(normalized_code) == 6 and normalized_code.isdigit():
-                    # 尝试再次搜索确认是否存在
-                    try:
-                        search_res = await self.analyzer.search_fund(normalized_code)
-                        if not search_res:
-                            yield event.plain_result(
-                                f"❌ 未找到基金代码 {fund_code}\n"
-                                "💡 请检查代码是否正确，或使用「搜索基金 关键词」查找"
-                            )
-                            return
-                    except Exception:
-                        pass  # 搜索出错忽略，继续下面的判断
-
-                yield event.plain_result(
-                    f"⚠️ 暂时无法获取基金 {fund_code} 的数据\n"
-                    "💡 可能是数据源暂时不可用，或该基金为非LOF基金\n"
-                    "💡 请稍后重试"
-                )
-
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
         except ImportError:
             yield event.plain_result(
                 "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
@@ -823,63 +916,30 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"查询基金行情出错: {e}")
             yield event.plain_result(f"❌ 查询失败: {str(e)}")
 
-    @filter.command("基金分析")
+    @基金.command("技术分析")
     async def fund_analysis(self, event: AstrMessageEvent, code: str = ""):
         """
         基金技术分析
-        用法: 基金分析 [基金代码]
-        示例: 基金分析 161226
+        用法: 基金 技术分析 [基金代码]
+        示例: 基金 技术分析 161226
         """
         try:
-            user_id = event.get_sender_id()
-            # 标准化基金代码，补齐前导0
-            normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
+            info = await self._get_fund_info(event, code)
 
-            yield event.plain_result(f"📊 正在生成基金 {fund_code} 分析报告...")
-
-            # 获取实时行情
-            info = await self.analyzer.get_lof_realtime(fund_code)
-            if not info:
-                # 区分是基金代码错误还是数据源问题
-                if not normalized_code:
-                    yield event.plain_result(f"❌ 基金代码不能为空")
-                    return
-
-                # 如果代码是6位数字，通常是有效的基金代码格式，但未找到数据
-                if len(normalized_code) == 6 and normalized_code.isdigit():
-                    # 尝试再次搜索确认是否存在
-                    try:
-                        search_res = await self.analyzer.search_fund(normalized_code)
-                        if not search_res:
-                            yield event.plain_result(
-                                f"❌ 未找到基金代码 {fund_code}\n"
-                                "💡 请检查代码是否正确，或使用「搜索基金 关键词」查找"
-                            )
-                            return
-                    except Exception:
-                        pass  # 搜索出错忽略，继续下面的判断
-
-                yield event.plain_result(
-                    f"⚠️ 暂时无法获取基金 {fund_code} 的数据\n"
-                    "💡 可能是数据源暂时不可用，或该基金为非LOF基金\n"
-                    "💡 请稍后重试"
-                )
-                return
+            yield event.plain_result(f"📊 正在生成基金 {info.code} 分析报告...")
 
             # 获取历史数据进行分析
-            history = await self.analyzer.get_lof_history(fund_code, days=30)
+            history = await self.analyzer.get_lof_history(info.code, days=30)
 
             # 计算技术指标
             indicators = {}
+            plot_img = None
             if history:
                 indicators = self.analyzer.calculate_technical_indicators(history)
                 # 绘制小图用于报告
                 plot_img = await asyncio.to_thread(
                     self._plot_history_chart, history, info.name
                 )
-            else:
-                plot_img = None
 
             # 准备模板数据
             ma_data = []
@@ -904,30 +964,12 @@ class FundAnalyzerPlugin(Star):
                 "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
-            # 读取模板
-            template_path = self._data_dir / "templates" / "analysis_report.html"
-            # 如果不在数据目录，尝试检查插件目录
-            if not template_path.exists():
-                template_path = (
-                    Path(__file__).parent / "templates" / "analysis_report.html"
-                )
-
-            if not template_path.exists():
-                # 降级到文本模式
-                yield event.plain_result(self._format_analysis(info, indicators))
-                return
-
-            with open(template_path, "r", encoding="utf-8") as f:
-                template_str = f.read()
-
-            # 渲染图片
-            img_url = await self.image_renderer.render_custom_template(
-                tmpl_str=template_str, tmpl_data=data, return_url=True
-            )
-
-            # 发送图片
+            # 渲染图片（本地优先，回退网络）
+            img_url = await self._render_report("analysis_report.html", data, width=420)
             yield event.image_result(img_url)
 
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
         except ImportError:
             yield event.plain_result(
                 "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
@@ -1047,21 +1089,16 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"绘图失败: {e}")
             return None
 
-    @filter.command("基金历史")
+    @基金.command("历史")
     async def fund_history(
         self, event: AstrMessageEvent, code: str = "", days: str = "10"
     ):
         """
         查询基金历史行情
-        用法: 基金历史 [基金代码] [天数]
-        示例: 基金历史 161226 10
+        用法: 基金 历史 [基金代码] [天数]
+        示例: 基金 历史 161226 10
         """
         try:
-            user_id = event.get_sender_id()
-            # 标准化基金代码，补齐前导0
-            normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
-
             try:
                 num_days = int(days)
                 if num_days < 1:
@@ -1071,81 +1108,50 @@ class FundAnalyzerPlugin(Star):
             except ValueError:
                 num_days = 10
 
+            info = await self._get_fund_info(event, code)
+            fund_code = info.code
+            fund_name = info.name
+
             yield event.plain_result(
                 f"📜 正在生成基金 {fund_code} 近 {num_days} 日行情报告..."
             )
 
-            # 获取基金名称
-            info = await self.analyzer.get_lof_realtime(fund_code)
-            fund_name = info.name if info else fund_code
-
             history = await self.analyzer.get_lof_history(fund_code, days=num_days)
 
-            if history:
-                # 绘制走势图
-                plot_img = await asyncio.to_thread(
-                    self._plot_history_chart, history, fund_name
-                )
-
-                # 计算区间统计
-                closes = [d["close"] for d in history]
-                total_return = (
-                    ((closes[-1] - closes[0]) / closes[0]) * 100 if closes[0] else 0
-                )
-
-                # 准备模板数据
-                data = {
-                    "fund_name": fund_name,
-                    "fund_code": fund_code,
-                    "days": num_days,
-                    "history_list": list(reversed(history)),  # 倒序显示，最近的在前面
-                    "plot_img": plot_img,
-                    "total_return": total_return,
-                    "max_price": max(closes),
-                    "min_price": min(closes),
-                    "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-
-                # 读取模板
-                template_path = (
-                    Path(__file__).parent / "templates" / "history_report.html"
-                )
-                if not template_path.exists():
-                    yield event.plain_result(f"❌ 模板文件不存在: {template_path}")
-                    return
-
-                # 渲染图片 - 优先使用本地渲染器
-                if self.use_local_renderer:
-                    try:
-                        img_path = await render_fund_image(
-                            template_path=template_path, template_data=data, width=420
-                        )
-                        yield event.image_result(img_path)
-                    except Exception as e:
-                        logger.warning(f"本地渲染失败，回退到网络渲染: {e}")
-                        # 回退到网络渲染
-                        with open(template_path, "r", encoding="utf-8") as f:
-                            template_str = f.read()
-                        img_url = await self.image_renderer.render_custom_template(
-                            tmpl_str=template_str,
-                            tmpl_data=data,
-                            return_url=True,
-                        )
-                        yield event.image_result(img_url)
-                else:
-                    # 使用网络渲染
-                    with open(template_path, "r", encoding="utf-8") as f:
-                        template_str = f.read()
-                    img_url = await self.image_renderer.render_custom_template(
-                        tmpl_str=template_str,
-                        tmpl_data=data,
-                        return_url=True,
-                    )
-                    yield event.image_result(img_url)
-
-            else:
+            if not history:
                 yield event.plain_result(f"❌ 未找到基金 {fund_code} 的历史数据")
+                return
 
+            # 绘制走势图
+            plot_img = await asyncio.to_thread(
+                self._plot_history_chart, history, fund_name
+            )
+
+            # 计算区间统计
+            closes = [d["close"] for d in history]
+            total_return = (
+                ((closes[-1] - closes[0]) / closes[0]) * 100 if closes[0] else 0
+            )
+
+            # 准备模板数据
+            data = {
+                "fund_name": fund_name,
+                "fund_code": fund_code,
+                "days": num_days,
+                "history_list": list(reversed(history)),  # 倒序显示，最近的在前面
+                "plot_img": plot_img,
+                "total_return": total_return,
+                "max_price": max(closes),
+                "min_price": min(closes),
+                "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            # 渲染图片（本地优先，回退网络）
+            img = await self._render_report("history_report.html", data, width=420)
+            yield event.image_result(img)
+
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
         except ImportError:
             yield event.plain_result(
                 "❌ AKShare 库未安装\n请管理员执行: pip install akshare matplotlib"
@@ -1156,16 +1162,16 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"查询基金历史出错: {e}")
             yield event.plain_result(f"❌ 查询失败: {str(e)}")
 
-    @filter.command("搜索基金")
-    async def search_fund(self, event: AstrMessageEvent, keyword: str = ""):
+    @基金.command("搜索")
+    async def fund_search(self, event: AstrMessageEvent, keyword: str = ""):
         """
         搜索LOF基金
-        用法: 搜索基金 关键词
-        示例: 搜索基金 白银
+        用法: 基金 搜索 关键词
+        示例: 基金 搜索 白银
         """
         if not keyword:
             yield event.plain_result(
-                "❓ 请输入搜索关键词\n用法: 搜索基金 关键词\n示例: 搜索基金 白银"
+                "❓ 请输入搜索关键词\n用法: 基金 搜索 关键词\n示例: 基金 搜索 白银"
             )
             return
 
@@ -1197,8 +1203,8 @@ class FundAnalyzerPlugin(Star):
                     )
 
                 text_lines.append("━━━━━━━━━━━━━━━━━")
-                text_lines.append("💡 使用「基金 代码」查看详情")
-                text_lines.append("💡 使用「设置基金 代码」设为默认")
+                text_lines.append("💡 使用「基金 行情 代码」查看详情")
+                text_lines.append("💡 使用「基金 设置 代码」设为默认")
 
                 yield event.plain_result("\n".join(text_lines))
             else:
@@ -1216,44 +1222,40 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"搜索基金出错: {e}")
             yield event.plain_result(f"❌ 搜索失败: {str(e)}")
 
-    @filter.command("设置基金")
-    async def set_default_fund(self, event: AstrMessageEvent, code: str = ""):
+    @基金.command("设置")
+    async def fund_set_default(self, event: AstrMessageEvent, code: str = ""):
         """
         设置默认关注的基金
-        用法: 设置基金 基金代码
-        示例: 设置基金 161226
+        用法: 基金 设置 [基金代码]
+        示例: 基金 设置 161226
         """
         if not code:
             user_id = event.get_sender_id()
             current = self._get_user_fund(user_id)
             yield event.plain_result(
                 f"💡 当前默认基金: {current}\n"
-                "用法: 设置基金 基金代码\n"
-                "示例: 设置基金 161226"
+                "用法: 基金 设置 [基金代码]\n"
+                "示例: 基金 设置 161226"
             )
             return
 
         try:
             # 标准化基金代码，补齐前导0
-            code = self._normalize_fund_code(code) or code
+            normalize_code = self._normalize_fund_code(code) or code
             # 验证基金代码是否有效
-            info = await self.analyzer.get_lof_realtime(code)
+            info = await self._get_fund_info(event, normalize_code)
 
-            if info:
-                user_id = event.get_sender_id()
-                self.user_fund_settings[user_id] = code
-                self._save_user_settings()  # 持久化保存
-                yield event.plain_result(
-                    f"✅ 已设置默认基金\n"
-                    f"📊 {info.code} - {info.name}\n"
-                    f"💰 当前价格: {info.latest_price:.4f}"
-                )
-            else:
-                yield event.plain_result(
-                    f"❌ 无效的基金代码: {code}\n"
-                    "💡 请使用「搜索基金 关键词」查找正确代码"
-                )
+            user_id = event.get_sender_id()
+            self.user_fund_settings[user_id] = info.code
+            self._save_user_settings()  # 持久化保存
+            yield event.plain_result(
+                f"✅ 已设置默认基金\n"
+                f"📊 {info.code} - {info.name}\n"
+                f"💰 当前价格: {info.latest_price:.4f}"
+            )
 
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
         except ImportError:
             yield event.plain_result(
                 "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
@@ -1264,63 +1266,24 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"设置默认基金出错: {e}")
             yield event.plain_result(f"❌ 设置失败: {str(e)}")
 
-    @filter.command("智能分析")
-    async def ai_fund_analysis(self, event: AstrMessageEvent, code: str = ""):
+    @基金.command("智能分析")
+    async def fund_ai_debate(self, event: AstrMessageEvent, code: str = ""):
         """
-        使用大模型进行智能基金分析（含量化数据）
-        用法: 智能分析 [基金代码]
-        示例: 智能分析 161226
+        多智能体博弈分析（6 Agent + 多空辩论 + 博弈论裁定）—— 基金数据源
+        用法: 基金 智能分析 [基金代码]
+        示例: 基金 智能分析 161226
         """
         try:
-            user_id = event.get_sender_id()
-            # 标准化基金代码，补齐前导0
-            normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
+            info = await self._get_fund_info(event, code)
+            fund_code = info.code
 
             yield event.plain_result(
-                f"🤖 正在对基金 {fund_code} 进行智能分析...\n"
-                "📊 收集数据中，请稍候（约需30秒）..."
+                f"⚖️ 即将对 {fund_code} 启动多智能体博弈分析\n"
+                "🧠 6 位 AI 分析师 + 多空辩论 + 博弈论裁定\n"
+                "📡 正在采集基金数据，预计需要 3-5 分钟..."
             )
 
-            # 1. 获取基金基本信息
-            info = await self.analyzer.get_lof_realtime(fund_code)
-            if not info:
-                # 区分是基金代码错误还是数据源问题
-                if not normalized_code:
-                    yield event.plain_result(f"❌ 基金代码不能为空")
-                    return
-
-                # 如果代码是6位数字，通常是有效的基金代码格式，但未找到数据
-                if len(normalized_code) == 6 and normalized_code.isdigit():
-                    # 尝试再次搜索确认是否存在
-                    try:
-                        search_res = await self.analyzer.search_fund(normalized_code)
-                        if not search_res:
-                            yield event.plain_result(
-                                f"❌ 未找到基金代码 {fund_code}\n"
-                                "💡 请检查代码是否正确，或使用「搜索基金 关键词」查找"
-                            )
-                            return
-                    except Exception:
-                        pass  # 搜索出错忽略，继续下面的判断
-
-                yield event.plain_result(
-                    f"⚠️ 暂时无法获取基金 {fund_code} 的数据\n"
-                    "💡 可能是数据源暂时不可用，或该基金为非LOF基金\n"
-                    "💡 请稍后重试"
-                )
-                return
-                return
-
-            # 2. 获取历史数据（获取60天以支持更多回测策略）
-            history = await self.analyzer.get_lof_history(fund_code, days=60)
-
-            # 3. 计算技术指标（保留旧方法兼容性）
-            indicators = {}
-            if history:
-                indicators = self.analyzer.calculate_technical_indicators(history)
-
-            # 4. 检查大模型是否可用
+            # 2. 检查大模型是否可用
             provider = self.context.get_using_provider()
             if not provider:
                 yield event.plain_result(
@@ -1329,118 +1292,74 @@ class FundAnalyzerPlugin(Star):
                 )
                 return
 
-            yield event.plain_result(
-                "🧠 AI 正在分析数据，生成报告中...\n📈 正在计算量化指标和策略回测..."
+            # 3. 获取历史数据和资金流向（基金数据源）
+            history_task = self.analyzer.get_lof_history(fund_code, days=60)
+            flow_task = self.analyzer._api.get_fund_flow(fund_code, days=10)
+
+            history_data = await history_task
+            fund_flow_data = []
+            try:
+                fund_flow_data = await flow_task
+            except Exception as e:
+                logger.debug(f"获取基金资金流向失败: {e}")
+
+            if not history_data or len(history_data) < 10:
+                yield event.plain_result(
+                    f"⚠️ 基金 {fund_code} 历史数据不足，无法进行深度分析"
+                )
+                return
+
+            # 4. 获取新闻摘要和影响因素（基金）
+            news_summary = await self.ai_analyzer.get_news_summary(
+                info.name, info.code, subject_type="基金"
+            )
+            factors_text = self.ai_analyzer.factors.format_factors_text(info.name)
+            global_situation_text = (
+                self.ai_analyzer.factors.format_global_situation_text(info.name)
             )
 
-            # 5. 获取资金流向数据（场内基金）
-            fund_flow_text = ""
-            try:
-                fund_flow = await self.analyzer._api.get_fund_flow(fund_code, days=10)
-                fund_flow_text = self.analyzer._api.format_fund_flow_text(fund_flow)
-            except Exception as e:
-                logger.debug(f"获取资金流向失败: {e}")
-                fund_flow_text = "暂无资金流向数据"
+            # 5. 创建辩论引擎并执行
+            from .stock.debate_engine import DebateEngine
 
-            # 6. 使用 AI 分析器执行分析（含量化数据和资金流向）
-            try:
-                analysis_result = await self.ai_analyzer.analyze(
-                    fund_info=info,
-                    history_data=history or [],
-                    technical_indicators=indicators,
-                    user_id=user_id,
-                    fund_flow_text=fund_flow_text,
-                )
+            engine = DebateEngine(self.context)
 
-                # 获取技术信号
-                signal, score = self.ai_analyzer.get_technical_signal(history or [])
+            # 进度回调：通过 yield 发送进度消息
+            progress_messages = []
 
-                # 使用 markdown 库将 Markdown 转换为 HTML
-                try:
-                    import markdown
+            async def on_progress(msg: str):
+                progress_messages.append(msg)
 
-                    formatted_content = markdown.markdown(
-                        analysis_result, extensions=["nl2br", "tables", "fenced_code"]
-                    )
-                except ImportError:
-                    # 如果 markdown 库不可用，回退到简单的正则替换
-                    import re
+            debate_result = await engine.run_debate(
+                fund_info=info,
+                history_data=history_data,
+                fund_flow_data=fund_flow_data,
+                news_summary=news_summary,
+                factors_text=factors_text,
+                global_situation_text=global_situation_text,
+                quant_analyzer=self.ai_analyzer.quant,
+                eastmoney_api=self.analyzer._api,
+                progress_callback=on_progress,
+            )
 
-                    formatted_content = re.sub(
-                        r"\*\*(.*?)\*\*", r"<strong>\1</strong>", analysis_result
-                    )
-                    # 处理换行
-                    formatted_content = formatted_content.replace("\n", "<br>")
+            # 6. 发送进度汇总
+            if progress_messages:
+                yield event.plain_result("\n".join(progress_messages))
 
-                # 准备模板数据
-                data = {
-                    "fund_name": info.name,
-                    "fund_code": info.code,
-                    "latest_price": info.latest_price,
-                    "change_amount": info.change_amount,
-                    "change_rate": info.change_rate,
-                    "signal": signal,
-                    "score": score,
-                    "analysis_content": formatted_content,
-                    "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
+            # 7. 渲染博弈报告图片（本地优先回退网络）；模板缺失则降级为纯文本摘要
+            is_image, render_out = await self._render_debate_report(
+                "debate_report.html", debate_result, info, engine
+            )
+            if is_image:
+                yield event.image_result(render_out)
+            else:
+                yield event.plain_result(render_out)
 
-                # 读取模板
-                template_path = self._data_dir / "templates" / "ai_analysis_report.html"
-                if not template_path.exists():
-                    template_path = (
-                        Path(__file__).parent / "templates" / "ai_analysis_report.html"
-                    )
+            # 8. 发送简洁文字结论（纯文本，不含 markdown）
+            summary = engine.format_debate_summary(debate_result)
+            yield event.plain_result(summary)
 
-                if not template_path.exists():
-                    # 降级到文本模式
-                    header = f"""
-🤖 【{info.name}】智能量化分析报告
-━━━━━━━━━━━━━━━━━
-📅 分析时间: {datetime.now().strftime("%Y-%m-%d %H:%M")}
-💰 当前价格: {info.latest_price:.4f} ({info.change_rate:+.2f}%)
-📊 技术信号: {signal} (评分: {score})
-━━━━━━━━━━━━━━━━━
-""".strip()
-                    yield event.plain_result(f"{header}\n\n{analysis_result}")
-                else:
-                    # 渲染图片 - 优先使用本地渲染器
-                    if self.use_local_renderer:
-                        try:
-                            img_path = await render_fund_image(
-                                template_path=template_path,
-                                template_data=data,
-                                width=480,
-                            )
-                            yield event.image_result(img_path)
-                        except Exception as e:
-                            logger.warning(f"本地渲染失败，回退到网络渲染: {e}")
-                            with open(template_path, "r", encoding="utf-8") as f:
-                                template_str = f.read()
-                            img_url = await self.image_renderer.render_custom_template(
-                                tmpl_str=template_str, tmpl_data=data, return_url=True
-                            )
-                            yield event.image_result(img_url)
-                    else:
-                        with open(template_path, "r", encoding="utf-8") as f:
-                            template_str = f.read()
-                        img_url = await self.image_renderer.render_custom_template(
-                            tmpl_str=template_str, tmpl_data=data, return_url=True
-                        )
-                        yield event.image_result(img_url)
-
-                # 添加免责声明 (如果是图片模式，免责声明已包含在图片底部，这里可以省略，或者发一条简短的)
-                # yield event.plain_result("⚠️ 投资有风险，决策需谨慎。")
-
-            except ValueError as e:
-                yield event.plain_result(f"❌ {str(e)}")
-            except Exception as e:
-                logger.error(f"AI分析失败: {e}")
-                yield event.plain_result(
-                    f"❌ AI 分析失败: {str(e)}\n"
-                    "💡 可能是大模型服务暂时不可用，请稍后再试"
-                )
-
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
         except ImportError:
             yield event.plain_result(
                 "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
@@ -1448,57 +1367,25 @@ class FundAnalyzerPlugin(Star):
         except TimeoutError as e:
             yield event.plain_result(f"⏰ {str(e)}\n💡 数据源响应较慢，请稍后再试")
         except Exception as e:
-            logger.error(f"智能分析出错: {e}")
-            yield event.plain_result(f"❌ 分析失败: {str(e)}")
+            logger.error(f"基金多智能体博弈分析出错: {e}")
+            yield event.plain_result(f"❌ 博弈分析失败: {str(e)}")
 
-    @filter.command("量化分析")
-    async def quant_analysis(self, event: AstrMessageEvent, code: str = ""):
+    @基金.command("量化分析")
+    async def fund_quant_analysis(self, event: AstrMessageEvent, code: str = ""):
         """
         纯量化分析（无需大模型）
         包含绩效指标、技术指标、策略回测
-        用法: 量化分析 [基金代码]
-        示例: 量化分析 161226
+        用法: 基金 量化分析 [基金代码]
+        示例: 基金 量化分析 161226
         """
         try:
-            user_id = event.get_sender_id()
-            # 标准化基金代码，补齐前导0
-            normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
+            info = await self._get_fund_info(event, code)
+            fund_code = info.code
 
             yield event.plain_result(
                 f"📊 正在对基金 {fund_code} 进行量化分析...\n"
                 "🔢 计算绩效指标、技术指标、策略回测中..."
             )
-
-            # 1. 获取基金基本信息
-            info = await self.analyzer.get_lof_realtime(fund_code)
-            if not info:
-                # 区分是基金代码错误还是数据源问题
-                if not normalized_code:
-                    yield event.plain_result(f"❌ 基金代码不能为空")
-                    return
-
-                # 如果代码是6位数字，通常是有效的基金代码格式，但未找到数据
-                if len(normalized_code) == 6 and normalized_code.isdigit():
-                    # 尝试再次搜索确认是否存在
-                    try:
-                        search_res = await self.analyzer.search_fund(normalized_code)
-                        if not search_res:
-                            yield event.plain_result(
-                                f"❌ 未找到基金代码 {fund_code}\n"
-                                "💡 请检查代码是否正确，或使用「搜索基金 关键词」查找"
-                            )
-                            return
-                    except Exception:
-                        pass  # 搜索出错忽略，继续下面的判断
-
-                yield event.plain_result(
-                    f"⚠️ 暂时无法获取基金 {fund_code} 的数据\n"
-                    "💡 可能是数据源暂时不可用，或该基金为非LOF基金\n"
-                    "💡 请稍后重试"
-                )
-                return
-                return
 
             # 2. 获取60天历史数据
             history = await self.analyzer.get_lof_history(fund_code, days=60)
@@ -1535,9 +1422,11 @@ class FundAnalyzerPlugin(Star):
                 "• VaR 95% 表示95%概率下的最大日亏损\n"
                 "• 策略回测基于历史数据模拟\n"
                 "━━━━━━━━━━━━━━━━━\n"
-                "💡 使用「智能分析」可获取 AI 深度解读"
+                "💡 使用「基金 智能分析」可获取多智能体博弈深度解读"
             )
 
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
         except ImportError:
             yield event.plain_result(
                 "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
@@ -1547,6 +1436,259 @@ class FundAnalyzerPlugin(Star):
         except Exception as e:
             logger.error(f"量化分析出错: {e}")
             yield event.plain_result(f"❌ 分析失败: {str(e)}")
+
+    # ============================================================
+    # 多智能体博弈分析共用：Markdown→HTML + 报告数据/渲染（基金组与股票组共用）
+    # ============================================================
+
+    def _md_to_html(self, text: str) -> str:
+        """将 Markdown 文本转换为 HTML（内置实现，无外部依赖）"""
+        import re as _re
+
+        if not text:
+            return ""
+
+        lines = text.split("\n")
+        html_parts: list[str] = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            # 空行 → 段落间距
+            if not stripped:
+                html_parts.append("")
+                i += 1
+                continue
+
+            # 标题 h1-h6
+            h_match = _re.match(r"^(#{1,6})\s+(.+)$", stripped)
+            if h_match:
+                level = len(h_match.group(1))
+                content = self._inline_md(h_match.group(2))
+                fs = max(18 - level * 2, 12)
+                html_parts.append(
+                    f"<h{level} style='margin:8px 0 4px;"
+                    f"font-size:{fs}px'>"
+                    f"{content}</h{level}>"
+                )
+                i += 1
+                continue
+
+            # 水平线
+            if _re.match(r"^[-*_]{3,}\s*$", stripped):
+                html_parts.append(
+                    "<hr style='border:none;"
+                    "border-top:1px solid #e0e0e0;"
+                    "margin:8px 0'>"
+                )
+                i += 1
+                continue
+
+            # 表格（以 | 开头的连续行）
+            if stripped.startswith("|") and "|" in stripped[1:]:
+                table_lines = []
+                while i < len(lines) and lines[i].strip().startswith("|"):
+                    table_lines.append(lines[i].strip())
+                    i += 1
+                html_parts.append(self._table_to_html(table_lines))
+                continue
+
+            # 无序列表（- / * / + 开头）
+            if _re.match(r"^[-*+]\s+", stripped):
+                items = []
+                while i < len(lines):
+                    li_match = _re.match(
+                        r"^\s*[-*+]\s+(.+)$", lines[i].strip()
+                    )
+                    if li_match:
+                        items.append(self._inline_md(li_match.group(1)))
+                        i += 1
+                    elif lines[i].strip() == "":
+                        i += 1
+                        break
+                    else:
+                        break
+                li_html = "".join(f"<li>{it}</li>" for it in items)
+                html_parts.append(
+                    f"<ul style='margin:4px 0;padding-left:20px'>{li_html}</ul>"
+                )
+                continue
+
+            # 有序列表（1. 开头）
+            if _re.match(r"^\d+[.)]\s+", stripped):
+                items = []
+                while i < len(lines):
+                    ol_match = _re.match(
+                        r"^\s*\d+[.)]\s+(.+)$", lines[i].strip()
+                    )
+                    if ol_match:
+                        items.append(self._inline_md(ol_match.group(1)))
+                        i += 1
+                    elif lines[i].strip() == "":
+                        i += 1
+                        break
+                    else:
+                        break
+                li_html = "".join(f"<li>{it}</li>" for it in items)
+                html_parts.append(
+                    f"<ol style='margin:4px 0;padding-left:20px'>{li_html}</ol>"
+                )
+                continue
+
+            # 普通文本行
+            content = self._inline_md(stripped)
+            html_parts.append(
+                f"<p style='margin:4px 0'>{content}</p>"
+            )
+            i += 1
+
+        return "\n".join(html_parts)
+
+    def _inline_md(self, text: str) -> str:
+        """处理行内 Markdown 格式"""
+        import re as _re
+
+        # 加粗+斜体 ***text***
+        text = _re.sub(
+            r"\*{3}(.+?)\*{3}",
+            r"<strong><em>\1</em></strong>",
+            text,
+        )
+        # 加粗 **text**
+        text = _re.sub(
+            r"\*{2}(.+?)\*{2}",
+            r"<strong>\1</strong>",
+            text,
+        )
+        # 斜体 *text*
+        text = _re.sub(
+            r"\*(.+?)\*",
+            r"<em>\1</em>",
+            text,
+        )
+        # 行内代码 `code`
+        code_style = (
+            "background:#f5f5f5;padding:1px 4px;"
+            "border-radius:3px;font-size:12px"
+        )
+        text = _re.sub(
+            r"`([^`]+)`",
+            rf"<code style='{code_style}'>\1</code>",
+            text,
+        )
+        # 链接 [text](url)
+        text = _re.sub(
+            r"\[([^\]]+)\]\(([^\)]+)\)",
+            r'<a href="\2">\1</a>',
+            text,
+        )
+        # emoji 标记保留（🔺🔻等已是 unicode）
+        return text
+
+    def _table_to_html(self, table_lines: list[str]) -> str:
+        """将 Markdown 表格行转换为 HTML 表格"""
+        import re as _re
+
+        if len(table_lines) < 2:
+            return "<br>".join(table_lines)
+
+        def _parse_row(row: str) -> list[str]:
+            cells = row.strip().strip("|").split("|")
+            return [self._inline_md(c.strip()) for c in cells]
+
+        rows = []
+        for tl in table_lines:
+            # 跳过分隔行 |---|---|
+            if _re.match(r"^\|[\s\-:|]+\|$", tl):
+                continue
+            rows.append(_parse_row(tl))
+
+        if not rows:
+            return ""
+
+        style = (
+            "width:100%;border-collapse:collapse;font-size:12px;margin:6px 0"
+        )
+        td_style = "border:1px solid #e0e0e0;padding:4px 6px"
+        th_style = f"{td_style};background:#f5f5f5;font-weight:600"
+
+        # 第一行当表头
+        header = rows[0]
+        th_html = "".join(f"<th style='{th_style}'>{c}</th>" for c in header)
+        body_html = ""
+        for row in rows[1:]:
+            td_html = "".join(f"<td style='{td_style}'>{c}</td>" for c in row)
+            body_html += f"<tr>{td_html}</tr>"
+
+        return (
+            f"<table style='{style}'>"
+            f"<thead><tr>{th_html}</tr></thead>"
+            f"<tbody>{body_html}</tbody>"
+            f"</table>"
+        )
+
+    def _build_debate_report_data(self, debate_result, info) -> dict:
+        """构建多智能体博弈报告的模板数据。"""
+        direction_class_map = {
+            "看涨": "bullish",
+            "看跌": "bearish",
+            "中性": "neutral",
+        }
+        direction_emoji_map = {"看涨": "📈", "看跌": "📉", "中性": "↔️"}
+
+        agents_data = []
+        for r in debate_result.agent_reports:
+            agents_data.append(
+                {
+                    "emoji": r.agent_emoji,
+                    "name": r.agent_name,
+                    "direction": r.direction,
+                    "direction_class": direction_class_map.get(
+                        r.direction, "neutral"
+                    ),
+                    "confidence": f"{r.confidence:.0f}",
+                }
+            )
+
+        return {
+            "fund_name": info.name,
+            "fund_code": info.code,
+            "final_direction": debate_result.final_direction,
+            "direction_class": direction_class_map.get(
+                debate_result.final_direction, "neutral"
+            ),
+            "direction_emoji": direction_emoji_map.get(
+                debate_result.final_direction, "❓"
+            ),
+            "confidence": f"{debate_result.confidence:.0f}",
+            "bull_win_rate": f"{debate_result.bull_win_rate:.0f}",
+            "bear_win_rate": f"{debate_result.bear_win_rate:.0f}",
+            "agents": agents_data,
+            "bull_argument_html": self._md_to_html(debate_result.bull_argument),
+            "bear_argument_html": self._md_to_html(debate_result.bear_argument),
+            "judge_verdict_html": self._md_to_html(debate_result.judge_verdict),
+            "total_llm_calls": debate_result.total_llm_calls,
+            "total_time": f"{debate_result.total_time_seconds:.0f}",
+            "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    async def _render_debate_report(
+        self, template_name: str, debate_result, info, engine
+    ) -> tuple[bool, str]:
+        """渲染博弈报告图片；模板缺失时降级为纯文本摘要。
+
+        返回 (is_image, content)：is_image 为 True 交由 caller yield image_result，
+        否则 yield plain_result。
+        """
+        tmpl_data = self._build_debate_report_data(debate_result, info)
+        try:
+            img = await self._render_report(template_name, tmpl_data, width=520)
+            return (True, img)
+        except CommandAbort:
+            # 模板缺失时降级到纯文本摘要
+            return (False, engine.format_debate_summary(debate_result))
 
     def _plot_comparison_chart(
         self,
@@ -1681,47 +1823,22 @@ class FundAnalyzerPlugin(Star):
     # ============================================================
     # 多智能体博弈分析指令
     # ============================================================
-    @filter.command("股票智能分析")
-    async def multi_agent_debate(self, event: AstrMessageEvent, code: str = ""):
+    @股票.command("智能分析")
+    async def stock_ai_debate(self, event: AstrMessageEvent, code: str = ""):
         """
-        多智能体博弈分析（6 Agent + 多空辩论 + 博弈论裁定）
-        用法: 股票智能分析 [基金/股票代码]
-        示例: 股票智能分析 161226
+        多智能体博弈分析（6 Agent + 多空辩论 + 博弈论裁定）—— A 股股票数据源
+        用法: 股票 智能分析 <股票代码>
+        示例: 股票 智能分析 600519
         """
         try:
-            user_id = event.get_sender_id()
-            normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
+            info = await self._get_stock_info(event, code)
+            stock_code = info.code
 
             yield event.plain_result(
-                f"⚖️ 即将对 {fund_code} 启动多智能体博弈分析\n"
+                f"⚖️ 即将对 {stock_code} 启动多智能体博弈分析\n"
                 "🧠 6 位 AI 分析师 + 多空辩论 + 博弈论裁定\n"
-                "📡 正在采集数据，预计需要 3-5 分钟..."
+                "📡 正在采集股票数据，预计需要 3-5 分钟..."
             )
-
-            # 1. 获取基金基本信息
-            info = await self.analyzer.get_lof_realtime(fund_code)
-            if not info:
-                if (
-                    normalized_code
-                    and len(normalized_code) == 6
-                    and normalized_code.isdigit()
-                ):
-                    try:
-                        search_res = await self.analyzer.search_fund(normalized_code)
-                        if not search_res:
-                            yield event.plain_result(
-                                f"❌ 未找到基金代码 {fund_code}\n"
-                                "💡 请检查代码是否正确，或使用「搜索基金 关键词」查找"
-                            )
-                            return
-                    except Exception:
-                        pass
-                yield event.plain_result(
-                    f"⚠️ 暂时无法获取基金 {fund_code} 的数据\n"
-                    "💡 可能是数据源暂时不可用，请稍后重试"
-                )
-                return
 
             # 2. 检查大模型是否可用
             provider = self.context.get_using_provider()
@@ -1732,27 +1849,29 @@ class FundAnalyzerPlugin(Star):
                 )
                 return
 
-            # 3. 获取历史数据和资金流向
-            history_task = self.analyzer.get_lof_history(fund_code, days=60)
-            flow_task = self.analyzer._api.get_fund_flow(fund_code, days=10)
+            # 3. 获取历史数据和资金流向（A股股票数据源）
+            history_task = self._emapi.get_stock_kline(stock_code, days=60)
+            flow_task = self._emapi.get_stock_flow(stock_code, days=10)
 
             history_data = await history_task
             fund_flow_data = []
             try:
                 fund_flow_data = await flow_task
             except Exception as e:
-                logger.debug(f"获取资金流向失败: {e}")
+                logger.debug(f"获取股票资金流向失败: {e}")
 
             if not history_data or len(history_data) < 10:
                 yield event.plain_result(
-                    f"⚠️ 基金 {fund_code} 历史数据不足，无法进行深度分析"
+                    f"⚠️ 股票 {stock_code} 历史数据不足，无法进行深度分析"
                 )
                 return
 
             # 4. 获取新闻摘要和影响因素
             # yield event.plain_result("📰 正在获取市场资讯和影响因素...")
 
-            news_summary = await self.ai_analyzer.get_news_summary(info.name, info.code)
+            news_summary = await self.ai_analyzer.get_news_summary(
+                info.name, info.code, subject_type="股票"
+            )
             factors_text = self.ai_analyzer.factors.format_factors_text(info.name)
             global_situation_text = (
                 self.ai_analyzer.factors.format_global_situation_text(info.name)
@@ -1777,7 +1896,7 @@ class FundAnalyzerPlugin(Star):
                 factors_text=factors_text,
                 global_situation_text=global_situation_text,
                 quant_analyzer=self.ai_analyzer.quant,
-                eastmoney_api=self.analyzer._api,
+                eastmoney_api=self._emapi,
                 progress_callback=on_progress,
             )
 
@@ -1785,278 +1904,21 @@ class FundAnalyzerPlugin(Star):
             if progress_messages:
                 yield event.plain_result("\n".join(progress_messages))
 
-            # 7. 尝试渲染图片报告
-            def _md_to_html(text: str) -> str:
-                """将 Markdown 文本转换为 HTML（内置实现，无外部依赖）"""
-                import re as _re
-
-                if not text:
-                    return ""
-
-                lines = text.split("\n")
-                html_parts: list[str] = []
-                i = 0
-
-                while i < len(lines):
-                    line = lines[i]
-                    stripped = line.strip()
-
-                    # 空行 → 段落间距
-                    if not stripped:
-                        html_parts.append("")
-                        i += 1
-                        continue
-
-                    # 标题 h1-h6
-                    h_match = _re.match(r"^(#{1,6})\s+(.+)$", stripped)
-                    if h_match:
-                        level = len(h_match.group(1))
-                        content = _inline_md(h_match.group(2))
-                        fs = max(18 - level * 2, 12)
-                        html_parts.append(
-                            f"<h{level} style='margin:8px 0 4px;"
-                            f"font-size:{fs}px'>"
-                            f"{content}</h{level}>"
-                        )
-                        i += 1
-                        continue
-
-                    # 水平线
-                    if _re.match(r"^[-*_]{3,}\s*$", stripped):
-                        html_parts.append(
-                            "<hr style='border:none;"
-                            "border-top:1px solid #e0e0e0;"
-                            "margin:8px 0'>"
-                        )
-                        i += 1
-                        continue
-
-                    # 表格（以 | 开头的连续行）
-                    if stripped.startswith("|") and "|" in stripped[1:]:
-                        table_lines = []
-                        while i < len(lines) and lines[i].strip().startswith("|"):
-                            table_lines.append(lines[i].strip())
-                            i += 1
-                        html_parts.append(_table_to_html(table_lines))
-                        continue
-
-                    # 无序列表（- / * / + 开头）
-                    if _re.match(r"^[-*+]\s+", stripped):
-                        items = []
-                        while i < len(lines):
-                            li_match = _re.match(
-                                r"^\s*[-*+]\s+(.+)$", lines[i].strip()
-                            )
-                            if li_match:
-                                items.append(_inline_md(li_match.group(1)))
-                                i += 1
-                            elif lines[i].strip() == "":
-                                i += 1
-                                break
-                            else:
-                                break
-                        li_html = "".join(f"<li>{it}</li>" for it in items)
-                        html_parts.append(
-                            f"<ul style='margin:4px 0;padding-left:20px'>{li_html}</ul>"
-                        )
-                        continue
-
-                    # 有序列表（1. 开头）
-                    if _re.match(r"^\d+[.)]\s+", stripped):
-                        items = []
-                        while i < len(lines):
-                            ol_match = _re.match(
-                                r"^\s*\d+[.)]\s+(.+)$", lines[i].strip()
-                            )
-                            if ol_match:
-                                items.append(_inline_md(ol_match.group(1)))
-                                i += 1
-                            elif lines[i].strip() == "":
-                                i += 1
-                                break
-                            else:
-                                break
-                        li_html = "".join(f"<li>{it}</li>" for it in items)
-                        html_parts.append(
-                            f"<ol style='margin:4px 0;padding-left:20px'>{li_html}</ol>"
-                        )
-                        continue
-
-                    # 普通文本行
-                    content = _inline_md(stripped)
-                    html_parts.append(
-                        f"<p style='margin:4px 0'>{content}</p>"
-                    )
-                    i += 1
-
-                return "\n".join(html_parts)
-
-            def _inline_md(text: str) -> str:
-                """处理行内 Markdown 格式"""
-                import re as _re
-
-                # 加粗+斜体 ***text***
-                text = _re.sub(
-                    r"\*{3}(.+?)\*{3}",
-                    r"<strong><em>\1</em></strong>",
-                    text,
-                )
-                # 加粗 **text**
-                text = _re.sub(
-                    r"\*{2}(.+?)\*{2}",
-                    r"<strong>\1</strong>",
-                    text,
-                )
-                # 斜体 *text*
-                text = _re.sub(
-                    r"\*(.+?)\*",
-                    r"<em>\1</em>",
-                    text,
-                )
-                # 行内代码 `code`
-                code_style = (
-                    "background:#f5f5f5;padding:1px 4px;"
-                    "border-radius:3px;font-size:12px"
-                )
-                text = _re.sub(
-                    r"`([^`]+)`",
-                    rf"<code style='{code_style}'>\1</code>",
-                    text,
-                )
-                # 链接 [text](url)
-                text = _re.sub(
-                    r"\[([^\]]+)\]\(([^\)]+)\)",
-                    r'<a href="\2">\1</a>',
-                    text,
-                )
-                # emoji 标记保留（🔺🔻等已是 unicode）
-                return text
-
-            def _table_to_html(table_lines: list[str]) -> str:
-                """将 Markdown 表格行转换为 HTML 表格"""
-                import re as _re
-
-                if len(table_lines) < 2:
-                    return "<br>".join(table_lines)
-
-                def _parse_row(row: str) -> list[str]:
-                    cells = row.strip().strip("|").split("|")
-                    return [_inline_md(c.strip()) for c in cells]
-
-                rows = []
-                for tl in table_lines:
-                    # 跳过分隔行 |---|---|
-                    if _re.match(r"^\|[\s\-:|]+\|$", tl):
-                        continue
-                    rows.append(_parse_row(tl))
-
-                if not rows:
-                    return ""
-
-                style = (
-                    "width:100%;border-collapse:collapse;font-size:12px;margin:6px 0"
-                )
-                td_style = "border:1px solid #e0e0e0;padding:4px 6px"
-                th_style = f"{td_style};background:#f5f5f5;font-weight:600"
-
-                # 第一行当表头
-                header = rows[0]
-                th_html = "".join(f"<th style='{th_style}'>{c}</th>" for c in header)
-                body_html = ""
-                for row in rows[1:]:
-                    td_html = "".join(f"<td style='{td_style}'>{c}</td>" for c in row)
-                    body_html += f"<tr>{td_html}</tr>"
-
-                return (
-                    f"<table style='{style}'>"
-                    f"<thead><tr>{th_html}</tr></thead>"
-                    f"<tbody>{body_html}</tbody>"
-                    f"</table>"
-                )
-
-            direction_class_map = {
-                "看涨": "bullish",
-                "看跌": "bearish",
-                "中性": "neutral",
-            }
-            direction_emoji_map = {"看涨": "📈", "看跌": "📉", "中性": "↔️"}
-
-            agents_data = []
-            for r in debate_result.agent_reports:
-                agents_data.append(
-                    {
-                        "emoji": r.agent_emoji,
-                        "name": r.agent_name,
-                        "direction": r.direction,
-                        "direction_class": direction_class_map.get(
-                            r.direction, "neutral"
-                        ),
-                        "confidence": f"{r.confidence:.0f}",
-                    }
-                )
-
-            tmpl_data = {
-                "fund_name": info.name,
-                "fund_code": info.code,
-                "final_direction": debate_result.final_direction,
-                "direction_class": direction_class_map.get(
-                    debate_result.final_direction, "neutral"
-                ),
-                "direction_emoji": direction_emoji_map.get(
-                    debate_result.final_direction, "❓"
-                ),
-                "confidence": f"{debate_result.confidence:.0f}",
-                "bull_win_rate": f"{debate_result.bull_win_rate:.0f}",
-                "bear_win_rate": f"{debate_result.bear_win_rate:.0f}",
-                "agents": agents_data,
-                "bull_argument_html": _md_to_html(debate_result.bull_argument),
-                "bear_argument_html": _md_to_html(debate_result.bear_argument),
-                "judge_verdict_html": _md_to_html(debate_result.judge_verdict),
-                "total_llm_calls": debate_result.total_llm_calls,
-                "total_time": f"{debate_result.total_time_seconds:.0f}",
-                "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-            template_path = self._data_dir / "templates" / "debate_report.html"
-            if not template_path.exists():
-                template_path = (
-                    Path(__file__).parent / "templates" / "debate_report.html"
-                )
-
-            if template_path.exists():
-                # 渲染图片报告
-                if self.use_local_renderer:
-                    try:
-                        img_path = await render_fund_image(
-                            template_path=template_path,
-                            template_data=tmpl_data,
-                            width=520,
-                        )
-                        yield event.image_result(img_path)
-                    except Exception as e:
-                        logger.warning(f"本地渲染失败，回退到网络渲染: {e}")
-                        with open(template_path, encoding="utf-8") as f:
-                            template_str = f.read()
-                        img_url = await self.image_renderer.render_custom_template(
-                            tmpl_str=template_str, tmpl_data=tmpl_data, return_url=True
-                        )
-                        yield event.image_result(img_url)
-                else:
-                    with open(template_path, encoding="utf-8") as f:
-                        template_str = f.read()
-                    img_url = await self.image_renderer.render_custom_template(
-                        tmpl_str=template_str, tmpl_data=tmpl_data, return_url=True
-                    )
-                    yield event.image_result(img_url)
+            # 7. 渲染博弈报告图片（本地优先回退网络）；模板缺失则降级为纯文本摘要
+            is_image, render_out = await self._render_debate_report(
+                "stock_debate_report.html", debate_result, info, engine
+            )
+            if is_image:
+                yield event.image_result(render_out)
             else:
-                # 降级到纯文本摘要
-                summary = engine.format_debate_summary(debate_result)
-                yield event.plain_result(summary)
+                yield event.plain_result(render_out)
 
             # 8. 发送简洁文字结论（纯文本，不含 markdown）
             summary = engine.format_debate_summary(debate_result)
             yield event.plain_result(summary)
 
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
         except ImportError:
             yield event.plain_result(
                 "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
@@ -2067,85 +1929,40 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"多智能体博弈分析出错: {e}")
             yield event.plain_result(f"❌ 博弈分析失败: {str(e)}")
 
-    @filter.command("基金对比")
+    @基金.command("对比")
     async def fund_compare(
         self, event: AstrMessageEvent, code1: str = "", code2: str = ""
     ):
         """
         对比两只基金的表现
-        用法: 基金对比 [代码1] [代码2]
-        示例: 基金对比 161226 160220
+        用法: 基金 对比 [代码1] [代码2]
+        示例: 基金 对比 161226 160220
         """
         if not code1 or not code2:
             yield event.plain_result(
-                "❌ 请提供两个基金代码\n用法: 基金对比 代码1 代码2\n示例: 基金对比 161226 160220"
+                "❌ 请提供两个基金代码\n用法: 基金 对比 代码1 代码2\n示例: 基金 对比 161226 160220"
             )
             return
 
         try:
-            # 标准化代码
-            code1 = self._normalize_fund_code(code1) or code1
-            code2 = self._normalize_fund_code(code2) or code2
-
-            yield event.plain_result(f"⚖️ 正在对比基金 {code1} vs {code2}...")
-
-            # 并发获取两个基金的信息和历史数据
-            # 使用 gather 提高效率
-            task1 = self.analyzer.get_lof_realtime(code1)
-            task2 = self.analyzer.get_lof_realtime(code2)
-            task3 = self.analyzer.get_lof_history(code1, days=60)
-            task4 = self.analyzer.get_lof_history(code2, days=60)
-
-            info1, info2, hist1, hist2 = await asyncio.gather(
-                task1, task2, task3, task4
+            # 并发获取两个基金信息
+            info1, info2 = await asyncio.gather(
+                self._get_fund_info(event, code1),
+                self._get_fund_info(event, code2),
             )
 
-            if not info1:
-                # 尝试区分错误原因 (基金1)
-                if len(code1) == 6 and code1.isdigit():
-                    try:
-                        search_res = await self.analyzer.search_fund(code1)
-                        if not search_res:
-                            yield event.plain_result(
-                                f"❌ 未找到基金代码 {code1}\n"
-                                "💡 请检查代码是否正确，或使用「搜索基金 关键词」查找"
-                            )
-                            return
-                    except Exception:
-                        pass
+            yield event.plain_result(f"⚖️ 正在对比基金 {info1.code} vs {info2.code}...")
 
-                yield event.plain_result(
-                    f"⚠️ 暂时无法获取基金 {code1} 的数据\n"
-                    "💡 可能是数据源暂时不可用，或该基金为非LOF基金\n"
-                    "💡 请稍后重试"
-                )
-                return
+            # 并发获取两个基金的历史数据
+            task3 = self.analyzer.get_lof_history(info1.code, days=60)
+            task4 = self.analyzer.get_lof_history(info2.code, days=60)
+            hist1, hist2 = await asyncio.gather(task3, task4)
 
-            if not info2:
-                # 尝试区分错误原因 (基金2)
-                if len(code2) == 6 and code2.isdigit():
-                    try:
-                        search_res = await self.analyzer.search_fund(code2)
-                        if not search_res:
-                            yield event.plain_result(
-                                f"❌ 未找到基金代码 {code2}\n"
-                                "💡 请检查代码是否正确，或使用「搜索基金 关键词」查找"
-                            )
-                            return
-                    except Exception:
-                        pass
-
-                yield event.plain_result(
-                    f"⚠️ 暂时无法获取基金 {code2} 的数据\n"
-                    "💡 可能是数据源暂时不可用，或该基金为非LOF基金\n"
-                    "💡 请稍后重试"
-                )
-                return
             if not hist1 or len(hist1) < 10:
-                yield event.plain_result(f"⚠️ 基金 {code1} 历史数据不足")
+                yield event.plain_result(f"⚠️ 基金 {info1.code} 历史数据不足")
                 return
             if not hist2 or len(hist2) < 10:
-                yield event.plain_result(f"⚠️ 基金 {code2} 历史数据不足")
+                yield event.plain_result(f"⚠️ 基金 {info2.code} 历史数据不足")
                 return
 
             # 计算量化指标
@@ -2178,80 +1995,367 @@ class FundAnalyzerPlugin(Star):
                 "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
-            # 渲染模板
-            template_path = self._data_dir / "templates" / "comparison_report.html"
-            if not template_path.exists():
-                template_path = (
-                    Path(__file__).parent / "templates" / "comparison_report.html"
-                )
+            # 渲染模板（本地优先，回退网络）
+            img = await self._render_report("comparison_report.html", data, width=480)
+            yield event.image_result(img)
 
-            if not template_path.exists():
-                yield event.plain_result("❌ 模板文件缺失")
-                return
-
-            with open(template_path, "r", encoding="utf-8") as f:
-                template_str = f.read()
-
-            img_url = await self.image_renderer.render_custom_template(
-                tmpl_str=template_str, tmpl_data=data, return_url=True
-            )
-
-            yield event.image_result(img_url)
-
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
         except Exception as e:
             logger.error(f"基金对比出错: {e}")
             yield event.plain_result(f"❌ 对比失败: {str(e)}")
 
-    @filter.command("基金帮助")
+    @基金.command("帮助")
     async def fund_help(self, event: AstrMessageEvent):
-        """显示基金分析插件帮助信息"""
+        """显示基金指令组帮助信息"""
         help_text = """
-📊 基金/股票分析插件帮助
+📊 基金指令组帮助
 ━━━━━━━━━━━━━━━━━
-💰 贵金属行情:
-🔹 今日行情 - 查询金价银价实时行情
-━━━━━━━━━━━━━━━━━
-📈 A股实时行情 (缓存10分钟):
-🔹 股票 <代码> - 查询A股实时行情
-🔹 搜索股票 关键词 - 搜索A股股票
-━━━━━━━━━━━━━━━━━
-📊 LOF基金功能:
-🔹 基金 [代码] - 查询基金实时行情
-🔹 基金分析 [代码] - 技术分析(均线/趋势)
-🔹 基金对比 [代码1] [代码2] - ⚖️对比两只基金
-🔹 量化分析 [代码] - 📈专业量化指标分析
-🔹 智能分析 [代码] - 🤖AI量化深度分析
-🔹 股票智能分析 [代码] - ⚖️多智能体博弈分析
-🔹 基金历史 [代码] [天数] - 查看历史行情
-🔹 搜索基金 关键词 - 搜索LOF基金
-🔹 设置基金 代码 - 设置默认基金
-🔹 基金帮助 - 显示本帮助
+🔹 基金 行情 [代码] - 查询基金实时行情
+🔹 基金 技术分析 [代码] - 技术分析(均线/趋势)
+🔹 基金 历史 [代码] [天数] - 查看历史行情
+🔹 基金 搜索 关键词 - 搜索LOF基金
+🔹 基金 设置 [代码] - 设置默认基金
+🔹 基金 智能分析 [代码] - ⚖️多智能体博弈分析
+🔹 基金 量化分析 [代码] - 📈专业量化指标分析
+🔹 基金 对比 代码1 代码2 - ⚖️对比两只基金
+🔹 基金 帮助 - 显示本帮助
 ━━━━━━━━━━━━━━━━━
 💡 默认基金: 国投瑞银白银期货(LOF)A
    基金代码: 161226
 ━━━━━━━━━━━━━━━━━
 📈 示例:
-  • 今日行情 (金银价格)
-  • 股票 000001 (平安银行)
-  • 搜索股票 茅台
-  • 基金 161226
-  • 基金分析
-  • 基金对比 161226 513100
-  • 量化分析 161226
-  • 智能分析 161226
-  • 股票智能分析 161226
-  • 基金历史 161226 20
-  • 搜索基金 白银
+  • 基金 行情 161226
+  • 基金 技术分析 161226
+  • 基金 历史 161226 20
+  • 基金 搜索 白银
+  • 基金 设置 161226
+  • 基金 智能分析 161226
+  • 基金 量化分析 161226
+  • 基金 对比 161226 513100
 ━━━━━━━━━━━━━━━━━
-🤖 智能分析功能说明:
-  调用AI大模型+量化数据，综合分析:
-  - 量化绩效评估和风险分析
-  - 技术指标深度解读
-  - 策略回测结果解读
-  - 相关市场动态和新闻
-  - 上涨趋势和概率预测
+⚖️ 基金 智能分析 功能说明:
+  6 位 AI 分析师独立研判 + 多空辩论 + 博弈论裁定:
+  - 📰 舆情Agent 情绪因子  - 🦈 游资Agent 龙虎榜
+  - 🛡️ 风控Agent 政策风险  - 📊 技术Agent 技术指标
+  - 🧩 筹码Agent 主力行为  - ⚡ 大单Agent 资金异动
 ━━━━━━━━━━━━━━━━━
-⚖️ 多智能体博弈分析说明:
+💰 贵金属行情使用「今日行情」
+📈 A股相关指令请使用「股票 帮助」
+⚠️ 数据来源: 东方财富 / 天天基金
+💡 投资有风险，入市需谨慎！
+""".strip()
+        yield event.plain_result(help_text)
+
+    # ============================================================
+    # 股票组新增指令（A股股票数据源）
+    # ============================================================
+
+    @股票.command("技术分析")
+    async def stock_analysis(self, event: AstrMessageEvent, code: str = ""):
+        """
+        A股技术分析
+        用法: 股票 技术分析 <股票代码>
+        示例: 股票 技术分析 600519
+        """
+        try:
+            info = await self._get_stock_info(event, code)
+
+            yield event.plain_result(f"📊 正在生成股票 {info.code} 分析报告...")
+
+            # 获取历史数据进行分析
+            history = await self._get_stock_history(info.code, days=30)
+
+            # 计算技术指标
+            indicators = {}
+            plot_img = None
+            if history:
+                indicators = self.analyzer.calculate_technical_indicators(history)
+                # 绘制小图用于报告
+                plot_img = await asyncio.to_thread(
+                    self._plot_history_chart, history, info.name
+                )
+
+            # 准备模板数据
+            ma_data = []
+            if indicators:
+                for ma in ["ma5", "ma10", "ma20"]:
+                    if indicators.get(ma):
+                        ma_data.append({"name": ma.upper(), "value": indicators[ma]})
+
+            data = {
+                "fund_name": info.name,
+                "fund_code": info.code,
+                "latest_price": info.latest_price,
+                "change_amount": info.change_amount,
+                "change_rate": info.change_rate,
+                "plot_img": plot_img,
+                "trend": indicators.get("trend", "数据不足"),
+                "volatility": indicators.get("volatility"),
+                "return_5d": indicators.get("return_5d"),
+                "return_10d": indicators.get("return_10d"),
+                "return_20d": indicators.get("return_20d"),
+                "ma_data": ma_data,
+                "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            # 渲染图片（本地优先，回退网络）
+            img = await self._render_report("stock_analysis_report.html", data, width=420)
+            yield event.image_result(img)
+
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError as e:
+            yield event.plain_result(f"⏰ {str(e)}\n💡 数据源响应较慢，请稍后再试")
+        except Exception as e:
+            logger.error(f"股票分析出错: {e}")
+            yield event.plain_result(f"❌ 分析失败: {str(e)}")
+
+    @股票.command("历史")
+    async def stock_history(self, event: AstrMessageEvent, code: str = "", days: str = "10"):
+        """
+        查询A股历史行情
+        用法: 股票 历史 <股票代码> [天数]
+        示例: 股票 历史 600519 10
+        """
+        try:
+            try:
+                num_days = int(days)
+                if num_days < 1:
+                    num_days = 10
+                elif num_days > 60:
+                    num_days = 60
+            except ValueError:
+                num_days = 10
+
+            info = await self._get_stock_info(event, code)
+            stock_code = info.code
+
+            yield event.plain_result(
+                f"📜 正在生成股票 {stock_code} 近 {num_days} 日行情报告..."
+            )
+
+            history = await self._get_stock_history(stock_code, days=num_days)
+
+            if not history:
+                yield event.plain_result(f"❌ 未找到股票 {stock_code} 的历史数据")
+                return
+
+            # 绘制走势图
+            plot_img = await asyncio.to_thread(
+                self._plot_history_chart, history, info.name
+            )
+
+            # 计算区间统计
+            closes = [d["close"] for d in history]
+            total_return = (
+                ((closes[-1] - closes[0]) / closes[0]) * 100 if closes[0] else 0
+            )
+
+            # 准备模板数据
+            data = {
+                "fund_name": info.name,
+                "fund_code": stock_code,
+                "days": num_days,
+                "history_list": list(reversed(history)),  # 倒序显示，最近的在前面
+                "plot_img": plot_img,
+                "total_return": total_return,
+                "max_price": max(closes),
+                "min_price": min(closes),
+                "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            # 渲染图片（本地优先，回退网络）
+            img = await self._render_report("stock_history_report.html", data, width=420)
+            yield event.image_result(img)
+
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError as e:
+            yield event.plain_result(f"⏰ {str(e)}\n💡 数据源响应较慢，请稍后再试")
+        except Exception as e:
+            logger.error(f"查询股票历史出错: {e}")
+            yield event.plain_result(f"❌ 查询失败: {str(e)}")
+
+    @股票.command("量化分析")
+    async def stock_quant_analysis(self, event: AstrMessageEvent, code: str = ""):
+        """
+        A股纯量化分析（无需大模型）
+        包含绩效指标、技术指标、策略回测
+        用法: 股票 量化分析 <股票代码>
+        示例: 股票 量化分析 600519
+        """
+        try:
+            info = await self._get_stock_info(event, code)
+            stock_code = info.code
+
+            yield event.plain_result(
+                f"📊 正在对股票 {stock_code} 进行量化分析...\n"
+                "🔢 计算绩效指标、技术指标、策略回测中..."
+            )
+
+            # 获取60天历史数据
+            history = await self._get_stock_history(stock_code, days=60)
+
+            if not history or len(history) < 20:
+                yield event.plain_result(
+                    f"📊 【{info.name}】\n"
+                    "⚠️ 历史数据不足（需要至少20天），无法进行量化分析"
+                )
+                return
+
+            # 使用量化分析器生成报告（无需 LLM）
+            quant_report = self.ai_analyzer.get_quant_summary(history)
+
+            # 输出报告
+            header = f"""
+📈 【{info.name}】量化分析报告
+━━━━━━━━━━━━━━━━━
+🔢 股票代码: {info.code}
+💰 当前价格: {info.latest_price:.2f}
+📊 今日涨跌: {info.change_rate:+.2f}%
+📅 分析时间: {datetime.now().strftime("%Y-%m-%d %H:%M")}
+━━━━━━━━━━━━━━━━━
+""".strip()
+
+            yield event.plain_result(f"{header}\n\n{quant_report}")
+
+            # 添加说明
+            yield event.plain_result(
+                "━━━━━━━━━━━━━━━━━\n"
+                "📌 指标说明:\n"
+                "• 夏普比率 > 1 表示风险调整后收益较好\n"
+                "• 最大回撤反映历史最大亏损幅度\n"
+                "• VaR 95% 表示95%概率下的最大日亏损\n"
+                "• 策略回测基于历史数据模拟\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "💡 使用「股票 智能分析」可获取多智能体博弈深度解读"
+            )
+
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError as e:
+            yield event.plain_result(f"⏰ {str(e)}\n💡 数据源响应较慢，请稍后再试")
+        except Exception as e:
+            logger.error(f"股票量化分析出错: {e}")
+            yield event.plain_result(f"❌ 分析失败: {str(e)}")
+
+    @股票.command("对比")
+    async def stock_compare(
+        self, event: AstrMessageEvent, code1: str = "", code2: str = ""
+    ):
+        """
+        对比两只A股的表现
+        用法: 股票 对比 代码1 代码2
+        示例: 股票 对比 600519 000001
+        """
+        if not code1 or not code2:
+            yield event.plain_result(
+                "❌ 请提供两个股票代码\n用法: 股票 对比 代码1 代码2\n示例: 股票 对比 600519 000001"
+            )
+            return
+
+        try:
+            # 并发获取两个股票信息
+            info1, info2 = await asyncio.gather(
+                self._get_stock_info(event, code1),
+                self._get_stock_info(event, code2),
+            )
+
+            yield event.plain_result(
+                f"⚖️ 正在对比股票 {info1.code} vs {info2.code}..."
+            )
+
+            # 并发获取两个股票的历史数据
+            hist1, hist2 = await asyncio.gather(
+                self._get_stock_history(info1.code, days=60),
+                self._get_stock_history(info2.code, days=60),
+            )
+
+            if not hist1 or len(hist1) < 10:
+                yield event.plain_result(f"⚠️ 股票 {info1.code} 历史数据不足")
+                return
+            if not hist2 or len(hist2) < 10:
+                yield event.plain_result(f"⚠️ 股票 {info2.code} 历史数据不足")
+                return
+
+            # 计算量化指标
+            from .ai_analyzer.quant import QuantAnalyzer
+
+            quant = QuantAnalyzer()
+
+            perf1 = quant.calculate_performance(hist1)
+            perf2 = quant.calculate_performance(hist2)
+
+            if not perf1 or not perf2:
+                yield event.plain_result("❌ 计算绩效指标失败")
+                return
+
+            # 绘制对比图
+            plot_img = await asyncio.to_thread(
+                self._plot_comparison_chart, hist1, info1.name, hist2, info2.name
+            )
+
+            # 准备模板数据
+            data = {
+                "fund_a_name": info1.name,
+                "fund_b_name": info2.name,
+                "fund_a_code": info1.code,
+                "fund_b_code": info2.code,
+                "days": 60,
+                "metrics_a": perf1,
+                "metrics_b": perf2,
+                "plot_img": plot_img,
+                "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            # 渲染模板（本地优先，回退网络）
+            img = await self._render_report("stock_comparison_report.html", data, width=480)
+            yield event.image_result(img)
+
+        except CommandAbort as e:
+            yield event.plain_result(e.message)
+        except Exception as e:
+            logger.error(f"股票对比出错: {e}")
+            yield event.plain_result(f"❌ 对比失败: {str(e)}")
+
+    @股票.command("帮助")
+    async def stock_help(self, event: AstrMessageEvent):
+        """显示股票指令组帮助信息"""
+        help_text = """
+📈 股票指令组帮助
+━━━━━━━━━━━━━━━━━
+🔹 股票 行情 <代码> - 查询A股实时行情
+🔹 股票 搜索 关键词 - 搜索A股股票
+🔹 股票 智能分析 <代码> - ⚖️多智能体博弈分析
+🔹 股票 技术分析 <代码> - 技术分析(均线/趋势)
+🔹 股票 量化分析 <代码> - 📈专业量化指标分析
+🔹 股票 历史 <代码> [天数] - 查看历史行情
+🔹 股票 对比 代码1 代码2 - ⚖️对比两只股票
+🔹 股票 帮助 - 显示本帮助
+━━━━━━━━━━━━━━━━━
+📈 示例:
+  • 股票 行情 000001 (平安银行)
+  • 股票 搜索 茅台
+  • 股票 智能分析 600519
+  • 股票 技术分析 600519
+  • 股票 量化分析 600519
+  • 股票 历史 600519 20
+  • 股票 对比 600519 000001
+━━━━━━━━━━━━━━━━━
+⚖️ 股票 智能分析 功能说明:
   6 位 AI 分析师独立研判 + 多空辩论 + 博弈论裁定:
   - 📰 舆情Agent: 情绪因子与市场舆论
   - 🦈 游资Agent: 龙虎榜与游资行为
@@ -2260,11 +2364,12 @@ class FundAnalyzerPlugin(Star):
   - 🧩 筹码Agent: 主力行为与筹码分布
   - ⚡ 大单Agent: 实时资金流向与异动
 ━━━━━━━━━━━━━━━━━
-⚠️ 数据来源: AKShare/国际金价网
+💰 贵金属行情使用「今日行情」
+📊 基金相关指令请使用「基金 帮助」
+⚠️ 数据来源: 东方财富
 💡 A股数据缓存10分钟，仅供参考
 💡 投资有风险，入市需谨慎！
 """.strip()
-        yield event.plain_result(help_text)
         yield event.plain_result(help_text)
 
     async def terminate(self):

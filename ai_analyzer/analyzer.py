@@ -40,6 +40,7 @@ class AIFundAnalyzer:
         self,
         fund_name: str,
         fund_code: str,
+        subject_type: str = "基金",
     ) -> str:
         """
         获取基金相关新闻摘要（增强版，含季节性因素和国际形势）
@@ -47,6 +48,7 @@ class AIFundAnalyzer:
         Args:
             fund_name: 基金名称
             fund_code: 基金代码
+            subject_type: 标的类型（基金/股票）
 
         Returns:
             新闻摘要文本
@@ -54,6 +56,8 @@ class AIFundAnalyzer:
         provider = self._get_provider()
         if not provider:
             return "暂无法获取新闻资讯（未配置大模型）"
+
+        slug = "stock" if subject_type == "股票" else "fund"
 
         # 获取影响因素
         factors = self.factors.get_factors(fund_name)
@@ -74,12 +78,13 @@ class AIFundAnalyzer:
             seasonal_context=seasonal_context,
             search_keywords=search_keywords,
             global_situation_text=global_situation_text,
+            subject_type=subject_type,
         )
 
         try:
             response = await provider.text_chat(
                 prompt=prompt,
-                session_id=f"fund_news_{fund_code}_{datetime.now().strftime('%Y%m%d')}",
+                session_id=f"{slug}_news_{fund_code}_{datetime.now().strftime('%Y%m%d')}",
                 persist=False,
             )
             return response.completion_text
@@ -94,6 +99,7 @@ class AIFundAnalyzer:
         technical_indicators: dict[str, Any],
         user_id: str,
         fund_flow_text: str = "",
+        subject_type: str = "基金",
     ) -> str:
         """
         执行 AI 智能分析（含量化数据和资金流向）
@@ -104,6 +110,7 @@ class AIFundAnalyzer:
             technical_indicators: 技术指标（旧版，保留兼容性）
             user_id: 用户 ID
             fund_flow_text: 资金流向数据文本
+            subject_type: 标的类型（基金/股票）
 
         Returns:
             分析结果文本
@@ -111,6 +118,8 @@ class AIFundAnalyzer:
         provider = self._get_provider()
         if not provider:
             raise ValueError("未配置大模型提供商")
+
+        slug = "stock" if subject_type == "股票" else "fund"
 
         # 1. 计算量化绩效指标
         performance = self.quant.calculate_performance(history_data)
@@ -138,7 +147,9 @@ class AIFundAnalyzer:
         history_summary = self.prompt_builder.format_history_summary(history_data)
 
         # 7. 获取新闻摘要（含国际形势）
-        news_summary = await self.get_news_summary(fund_info.name, fund_info.code)
+        news_summary = await self.get_news_summary(
+            fund_info.name, fund_info.code, subject_type=subject_type
+        )
 
         # 8. 构建分析提示词（使用新模板，含国际形势和资金流向）
         analysis_prompt = self._build_quant_analysis_prompt(
@@ -151,12 +162,13 @@ class AIFundAnalyzer:
             news_summary=news_summary,
             global_situation_text=global_situation_text,
             fund_flow_text=fund_flow_text,
+            subject_type=subject_type,
         )
 
         # 9. 调用大模型分析
         response = await provider.text_chat(
             prompt=analysis_prompt,
-            session_id=f"fund_analysis_{fund_info.code}_{user_id}",
+            session_id=f"{slug}_analysis_{fund_info.code}_{user_id}",
             persist=False,
         )
 
@@ -173,11 +185,13 @@ class AIFundAnalyzer:
         news_summary: str,
         global_situation_text: str = "",
         fund_flow_text: str = "",
+        subject_type: str = "基金",
     ) -> str:
         """构建包含量化数据、国际形势和资金流向的分析提示词"""
         from .prompts import ANALYSIS_PROMPT_TEMPLATE
 
         return ANALYSIS_PROMPT_TEMPLATE.format(
+            subject_type=subject_type,
             fund_name=fund_info.name,
             fund_code=fund_info.code,
             latest_price=fund_info.latest_price,
@@ -208,6 +222,7 @@ class AIFundAnalyzer:
         self,
         fund_info: Any,  # FundInfo 类型
         trend: str,
+        subject_type: str = "基金",
     ) -> str:
         """
         快速分析（简化版）
@@ -215,6 +230,7 @@ class AIFundAnalyzer:
         Args:
             fund_info: 基金信息对象
             trend: 技术趋势判断
+            subject_type: 标的类型（基金/股票）
 
         Returns:
             快速分析结果
@@ -223,17 +239,20 @@ class AIFundAnalyzer:
         if not provider:
             raise ValueError("未配置大模型提供商")
 
+        slug = "stock" if subject_type == "股票" else "fund"
+
         prompt = self.prompt_builder.build_quick_prompt(
             fund_name=fund_info.name,
             fund_code=fund_info.code,
             latest_price=fund_info.latest_price,
             change_rate=fund_info.change_rate,
             trend=trend,
+            subject_type=subject_type,
         )
 
         response = await provider.text_chat(
             prompt=prompt,
-            session_id=f"fund_quick_{fund_info.code}",
+            session_id=f"{slug}_quick_{fund_info.code}",
             persist=False,
         )
 
@@ -243,6 +262,7 @@ class AIFundAnalyzer:
         self,
         fund_info: Any,  # FundInfo 类型
         technical_indicators: dict[str, Any],
+        subject_type: str = "基金",
     ) -> str:
         """
         风险评估
@@ -250,6 +270,7 @@ class AIFundAnalyzer:
         Args:
             fund_info: 基金信息对象
             technical_indicators: 技术指标
+            subject_type: 标的类型（基金/股票）
 
         Returns:
             风险评估结果
@@ -257,6 +278,8 @@ class AIFundAnalyzer:
         provider = self._get_provider()
         if not provider:
             raise ValueError("未配置大模型提供商")
+
+        slug = "stock" if subject_type == "股票" else "fund"
 
         factors = self.factors.get_factors(fund_info.name)
 
@@ -267,11 +290,12 @@ class AIFundAnalyzer:
             volatility=technical_indicators.get("volatility", 0),
             high_20d=technical_indicators.get("high_20d", 0),
             low_20d=technical_indicators.get("low_20d", 0),
+            subject_type=subject_type,
         )
 
         response = await provider.text_chat(
             prompt=prompt,
-            session_id=f"fund_risk_{fund_info.code}",
+            session_id=f"{slug}_risk_{fund_info.code}",
             persist=False,
         )
 

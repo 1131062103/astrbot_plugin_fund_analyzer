@@ -611,7 +611,7 @@ class FundInfluenceFactors:
         """
         factors = FundInfluenceFactors.get_factors(fund_name)
 
-        text = f"基金类型: {factors['type']}\n"
+        text = f"标的类型: {factors['type']}\n"
         text += f"追踪标的: {factors['underlying']}\n"
         text += "主要影响因素:\n"
 
