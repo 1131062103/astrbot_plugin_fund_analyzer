@@ -1,0 +1,8 @@
+{
+  "ai_model": {
+    "description": "═══ AI 大模型选择 ═══",
+    "type": "string",
+    "hint": "智能分析、新闻摘要、多智能体博弈所使用的大模型名称。\n留空则使用 AstrBot 当前默认模型。\n填写你已配置的 LLM 提供商支持的模型名（与 AstrBot 提供商设置中填写的模型 ID 一致，如 gpt-4o、deepseek-chat 等）。\n💡 修改后无需重启，下次分析立即生效",
+    "default": ""
+  }
+}

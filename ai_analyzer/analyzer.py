@@ -11,6 +11,7 @@ from astrbot.api import logger
 from .factors import FundInfluenceFactors
 from .prompts import AnalysisPromptBuilder
 from .quant import QuantAnalyzer
+from ..model_router import resolve_model
 
 if TYPE_CHECKING:
     from astrbot.api.provider import Provider
@@ -20,14 +21,16 @@ if TYPE_CHECKING:
 class AIFundAnalyzer:
     """AI 智能基金分析器（含量化分析）"""
 
-    def __init__(self, context: "Context"):
+    def __init__(self, context: "Context", config=None):
         """
         初始化 AI 分析器
 
         Args:
             context: AstrBot 上下文
+            config: 插件配置（可选，用于指定使用的模型）
         """
         self.context = context
+        self.config = config or {}
         self.factors = FundInfluenceFactors()
         self.prompt_builder = AnalysisPromptBuilder()
         self.quant = QuantAnalyzer()  # 量化分析器
@@ -35,6 +38,10 @@ class AIFundAnalyzer:
     def _get_provider(self) -> "Provider | None":
         """获取 LLM 提供商"""
         return self.context.get_using_provider()
+
+    async def _resolve_model(self, provider) -> str | None:
+        """解析插件配置中指定的模型，无效时回退默认"""
+        return await resolve_model(provider, self.config)
 
     async def get_news_summary(
         self,
@@ -86,6 +93,7 @@ class AIFundAnalyzer:
                 prompt=prompt,
                 session_id=f"{slug}_news_{fund_code}_{datetime.now().strftime('%Y%m%d')}",
                 persist=False,
+                model=await self._resolve_model(provider),
             )
             return response.completion_text
         except Exception as e:
@@ -170,6 +178,7 @@ class AIFundAnalyzer:
             prompt=analysis_prompt,
             session_id=f"{slug}_analysis_{fund_info.code}_{user_id}",
             persist=False,
+            model=await self._resolve_model(provider),
         )
 
         return response.completion_text
@@ -254,6 +263,7 @@ class AIFundAnalyzer:
             prompt=prompt,
             session_id=f"{slug}_quick_{fund_info.code}",
             persist=False,
+            model=await self._resolve_model(provider),
         )
 
         return response.completion_text
@@ -297,6 +307,7 @@ class AIFundAnalyzer:
             prompt=prompt,
             session_id=f"{slug}_risk_{fund_info.code}",
             persist=False,
+            model=await self._resolve_model(provider),
         )
 
         return response.completion_text

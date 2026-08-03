@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from astrbot.api import logger
+from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.t2i.renderer import HtmlRenderer
@@ -268,7 +268,7 @@ METAL_CACHE_TTL = 900
     "astrbot_plugin_fund_analyzer",
     "2529huang",
     "基金数据分析插件 - 使用AKShare获取LOF/ETF基金数据",
-    "1.0.0",
+    "2.2.0",
 )
 class FundAnalyzerPlugin(Star):
     """基金分析插件主类"""
@@ -276,8 +276,9 @@ class FundAnalyzerPlugin(Star):
     # 用户设置文件名
     SETTINGS_FILE = "user_settings.json"
 
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
+        self.config = config or {}
         self.analyzer = FundAnalyzer()
         # 初始化股票分析器
         self.stock_analyzer = StockAnalyzer()
@@ -337,7 +338,7 @@ class FundAnalyzerPlugin(Star):
         if self._ai_analyzer is None:
             from .ai_analyzer import AIFundAnalyzer
 
-            self._ai_analyzer = AIFundAnalyzer(self.context)
+            self._ai_analyzer = AIFundAnalyzer(self.context, config=self.config)
         return self._ai_analyzer
 
     def _get_user_fund(self, user_id: str) -> str:
@@ -1321,7 +1322,7 @@ class FundAnalyzerPlugin(Star):
             # 5. 创建辩论引擎并执行
             from .stock.debate_engine import DebateEngine
 
-            engine = DebateEngine(self.context)
+            engine = DebateEngine(self.context, config=self.config)
 
             # 进度回调：通过 yield 发送进度消息
             progress_messages = []
@@ -1880,7 +1881,7 @@ class FundAnalyzerPlugin(Star):
             # 5. 创建辩论引擎并执行
             from .stock.debate_engine import DebateEngine
 
-            engine = DebateEngine(self.context)
+            engine = DebateEngine(self.context, config=self.config)
 
             # 进度回调：通过 yield 发送进度消息
             progress_messages = []

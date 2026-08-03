@@ -27,6 +27,7 @@ from .agent_prompts import (
     JUDGE_PROMPT,
 )
 from .data_collector import DataCollector
+from ..model_router import resolve_model
 
 
 @dataclass
@@ -70,12 +71,14 @@ class DebateResult:
 class DebateEngine:
     """多智能体辩论引擎"""
 
-    def __init__(self, context: Any):
+    def __init__(self, context: Any, config=None):
         """
         Args:
             context: AstrBot Context，用于获取 LLM Provider
+            config: 插件配置（可选，用于指定使用的模型）
         """
         self.context = context
+        self.config = config or {}
 
     def _get_provider(self):
         """获取 LLM Provider"""
@@ -83,6 +86,10 @@ class DebateEngine:
         if not provider:
             raise ValueError("未配置大模型提供商，请在管理面板配置 LLM 后再试")
         return provider
+
+    async def _resolve_model(self, provider) -> str | None:
+        """解析插件配置中指定的模型，无效时回退默认"""
+        return await resolve_model(provider, self.config)
 
     async def _call_llm(
         self,
@@ -105,6 +112,7 @@ class DebateEngine:
             resp = await provider.text_chat(
                 prompt=user_content,
                 system_prompt=system_prompt,
+                model=await self._resolve_model(provider),
             )
 
             if hasattr(resp, "completion_text"):
