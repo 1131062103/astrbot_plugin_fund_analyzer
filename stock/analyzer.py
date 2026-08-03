@@ -6,12 +6,42 @@ A股股票分析器
 
 import asyncio
 import math
+import os
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
 from astrbot.api import logger
 
 from .models import StockInfo
+
+# akshare 内部使用 requests，默认会读取环境变量里的代理配置（http_proxy/https_proxy）。
+# 而国内股票数据源（东方财富、新浪等）本身不支持走代理，若按用户启动命令导出的
+# http_proxy 关心，akshare 请求会被路由到代理导致超时。此处临时屏蔽代理环境变量。
+PROXY_ENV_KEYS = (
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+)
+
+
+@contextmanager
+def _bypass_proxy_env():
+    """临时清空代理环境变量并执行，结束自动恢复，避免影响 astrbot 其它需走代理的请求"""
+    saved = {key: os.environ.get(key) for key in PROXY_ENV_KEYS}
+    for key in PROXY_ENV_KEYS:
+        os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        for key, old in saved.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
 
 # 默认超时时间（秒）
 DEFAULT_TIMEOUT = 60
@@ -65,11 +95,20 @@ class StockAnalyzer:
         except (ValueError, TypeError):
             return default
 
+    def _fetch_ak_spot_em(self):
+        """带代理屏蔽的东财全量行情抓取（在线程中执行）"""
+        with _bypass_proxy_env():
+            return self._ak.stock_zh_a_spot_em()
+
+    def _fetch_ak_spot_sina(self):
+        """带代理屏蔽的新浪全量行情抓取（在线程中执行）"""
+        with _bypass_proxy_env():
+            return self._ak.stock_zh_a_spot()
+
     async def _fetch_stock_data_eastmoney(self):
-        """从东方财富获取A股实时行情数据"""
         logger.info("尝试从东方财富获取A股实时行情数据...")
         df = await asyncio.wait_for(
-            asyncio.to_thread(self._ak.stock_zh_a_spot_em),
+            asyncio.to_thread(self._fetch_ak_spot_em),
             timeout=DEFAULT_TIMEOUT,
         )
         return df
@@ -78,7 +117,7 @@ class StockAnalyzer:
         """从新浪获取A股实时行情数据（备用数据源）"""
         logger.info("尝试从新浪获取A股实时行情数据...")
         df = await asyncio.wait_for(
-            asyncio.to_thread(self._ak.stock_zh_a_spot),
+            asyncio.to_thread(self._fetch_ak_spot_sina),
             timeout=DEFAULT_TIMEOUT,
         )
         return df
